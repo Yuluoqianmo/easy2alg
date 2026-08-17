@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from "electron";
-import type { EasyEda2AllegroApi } from "../shared/ipc";
+import type { Easy2AlgApi } from "../shared/ipc";
 import { IpcChannels } from "../shared/ipc";
 import type { GenerationProgress, GenerationStage } from "../shared/schemas";
 
@@ -49,7 +49,7 @@ const parseGenerationProgress = (rawProgress: unknown): GenerationProgress => {
   };
 };
 
-const api: EasyEda2AllegroApi = {
+const api: Easy2AlgApi = {
   getAppInfo: () => ipcRenderer.invoke(IpcChannels.getAppInfo),
   getSettings: () => ipcRenderer.invoke(IpcChannels.getSettings),
   saveSettings: (settings) => ipcRenderer.invoke(IpcChannels.saveSettings, settings),
@@ -70,4 +70,4 @@ const api: EasyEda2AllegroApi = {
   openPath: (absolutePath) => ipcRenderer.invoke(IpcChannels.openPath, absolutePath),
 };
 
-contextBridge.exposeInMainWorld("easyeda2allegro", api);
+contextBridge.exposeInMainWorld("easy2alg", api);

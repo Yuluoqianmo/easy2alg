@@ -1,9 +1,9 @@
 import { getDemoFootprint } from "../../shared/demo-fixtures";
-import type { EasyEda2AllegroApi } from "../../shared/ipc";
+import type { Easy2AlgApi } from "../../shared/ipc";
 import type { AppSettings, GenerationProgress, HistoryEntry } from "../../shared/schemas";
 
-const SettingsKey = "easyeda2allegro.settings";
-const HistoryKey = "easyeda2allegro.history";
+const SettingsKey = "easy2alg.settings";
+const HistoryKey = "easy2alg.history";
 
 const readSettings = (): AppSettings => {
   const saved = window.localStorage.getItem(SettingsKey);
@@ -31,7 +31,7 @@ const wait = async (milliseconds: number): Promise<void> => {
   await new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds));
 };
 
-export const createMockApi = (): EasyEda2AllegroApi => {
+export const createMockApi = (): Easy2AlgApi => {
   const progressListeners = new Set<(progress: GenerationProgress) => void>();
   const retryScenarios = new Set<string>();
   const emitProgress = (progress: Omit<GenerationProgress, "timestamp">): void => {
@@ -156,7 +156,7 @@ export const createMockApi = (): EasyEda2AllegroApi => {
             stage: "failed",
             percent: 74,
             message: "首次检查失败，用于验证关闭后可以直接重试。",
-            diagnosticDirectory: "C:\\Users\\Demo\\AppData\\Local\\Temp\\easyeda2allegro-demo",
+            diagnosticDirectory: "C:\\Users\\Demo\\AppData\\Local\\Temp\\easy2alg-demo",
           });
           throw new Error("首次检查失败，用于验证关闭后可以直接重试。");
         }

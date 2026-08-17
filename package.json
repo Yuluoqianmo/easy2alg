@@ -1,10 +1,10 @@
 {
-  "name": "easyeda2allegro",
+  "name": "easy2alg",
   "version": "0.1.6",
   "description": "Convert EasyEDA/LCSC footprints into Cadence Allegro libraries",
   "main": "out/main/index.js",
   "type": "module",
-  "author": "EasyEDA2Allegro contributors",
+  "author": "Easy2ALG contributors",
   "license": "MIT",
   "scripts": {
     "dev": "electron-vite dev",
@@ -45,8 +45,8 @@
     "vitest": "4.1.10"
   },
   "build": {
-    "appId": "cn.easyeda2allegro.app",
-    "productName": "EasyEDA to Allegro",
+    "appId": "cn.easy2alg.app",
+    "productName": "Easy2ALG",
     "directories": {
       "output": "release"
     },
@@ -65,19 +65,19 @@
       ]
     },
     "nsis": {
-      "artifactName": "EasyEDA2Allegro-Setup-${version}-${arch}.${ext}",
+      "artifactName": "Easy2ALG-Setup-${version}-${arch}.${ext}",
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "EasyEDA to Allegro"
+      "shortcutName": "Easy2ALG"
     },
     "portable": {
-      "artifactName": "EasyEDA2Allegro-Portable-${version}-${arch}.${ext}"
+      "artifactName": "Easy2ALG-Portable-${version}-${arch}.${ext}"
     },
     "mac": {
       "category": "public.app-category.developer-tools",
-      "artifactName": "EasyEDA2Allegro-${version}-${arch}.${ext}"
+      "artifactName": "Easy2ALG-${version}-${arch}.${ext}"
     }
   },
   "engines": {

@@ -33,7 +33,7 @@ import {
   type ReactElement,
   type SetStateAction,
 } from "react";
-import type { EasyEda2AllegroApi } from "../../shared/ipc";
+import type { Easy2AlgApi } from "../../shared/ipc";
 import type {
   AllegroInstall,
   AllegroVersion,
@@ -48,7 +48,7 @@ import { createMockApi } from "./mock-api";
 
 type Page = "convert" | "history" | "settings";
 
-const createUnavailableApi = (): EasyEda2AllegroApi => {
+const createUnavailableApi = (): Easy2AlgApi => {
   const unavailable = async (): Promise<never> => {
     throw new Error(
       "软件后台服务未能启动。请关闭当前软件并使用完整安装包或免安装包重新打开。",
@@ -73,8 +73,8 @@ const createUnavailableApi = (): EasyEda2AllegroApi => {
 const isBrowserPreview =
   import.meta.env.DEV &&
   (window.location.protocol === "http:" || window.location.protocol === "https:");
-const api: EasyEda2AllegroApi =
-  window.easyeda2allegro ??
+const api: Easy2AlgApi =
+  window.easy2alg ??
   (isBrowserPreview ? createMockApi() : createUnavailableApi());
 const emptySettings: AppSettings = {
   allegroVersion: "23.1",
@@ -1095,7 +1095,7 @@ export const App = (): ReactElement => {
       <header className="topbar">
         <div className="brand">
           <div className="brand-mark"><span className="brand-trace" /></div>
-          <div className="brand-copy"><strong>EasyEDA → Allegro</strong><span>封装转换与检查</span></div>
+          <div className="brand-copy"><strong>Easy2ALG</strong><span>封装转换与检查</span></div>
         </div>
         <div className="top-actions">
           <button className="top-action" type="button" onClick={() => setPage("history")} data-testid="nav-history">

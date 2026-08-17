@@ -1,0 +1,8 @@
+node_modules/
+out/
+release/
+coverage/
+*.log
+.DS_Store
+.vite/
+qa-latest.png

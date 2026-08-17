@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=512, initial-scale=1" />
+    <title>EasyEDA to Allegro Icon</title>
+    <style>
+      * { box-sizing: border-box; }
+      html, body { width: 512px; height: 512px; margin: 0; overflow: hidden; background: transparent; }
+      body { display: grid; place-items: center; }
+      svg { width: 512px; height: 512px; }
+    </style>
+  </head>
+  <body>
+    <svg viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <linearGradient id="blue" x1="64" y1="48" x2="448" y2="464" gradientUnits="userSpaceOnUse">
+          <stop stop-color="#3973F0" />
+          <stop offset="1" stop-color="#1747B9" />
+        </linearGradient>
+      </defs>
+      <rect x="20" y="20" width="472" height="472" rx="112" fill="url(#blue)" />
+      <circle cx="158" cy="160" r="34" fill="none" stroke="white" stroke-width="25" />
+      <circle cx="354" cy="352" r="34" fill="none" stroke="white" stroke-width="25" />
+      <path d="M181 184L331 328" stroke="white" stroke-width="28" stroke-linecap="round" />
+      <path d="M160 346L348 160" stroke="white" stroke-width="28" stroke-linecap="round" opacity="0.9" />
+      <circle cx="160" cy="346" r="18" fill="white" />
+      <circle cx="348" cy="160" r="18" fill="white" />
+    </svg>
+  </body>
+</html>

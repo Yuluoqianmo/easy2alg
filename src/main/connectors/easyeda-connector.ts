@@ -72,7 +72,7 @@ export class EasyEdaConnector {
           "Accept-Encoding": "gzip, deflate",
           Referer: "https://easyeda.com/",
           "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/132.0 EasyEDA2Allegro/0.1",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/132.0 Easy2ALG/0.1",
         },
         signal: AbortSignal.timeout(30_000),
       });

@@ -191,7 +191,7 @@ const registerHandlers = (): void => {
 };
 
 app.whenReady().then(() => {
-  electronApp.setAppUserModelId("cn.easyeda2allegro.app");
+  electronApp.setAppUserModelId("cn.easy2alg.app");
   registerHandlers();
   createWindow();
   app.on("activate", () => {

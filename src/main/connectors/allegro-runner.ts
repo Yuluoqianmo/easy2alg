@@ -310,7 +310,7 @@ export class AllegroRunner {
       });
     };
     progress("preparing", 5, "正在准备封装数据和输出目录");
-    const jobDirectory = await mkdtemp(join(tmpdir(), "easyeda2allegro-"));
+    const jobDirectory = await mkdtemp(join(tmpdir(), "easy2alg-"));
     await mkdir(join(jobDirectory, "padstacks"), { recursive: true });
     const bundle = createAllegroSourceBundle(plan, jobDirectory);
     await writeSources(jobDirectory, bundle.sources);

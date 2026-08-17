@@ -9,7 +9,7 @@ import type {
   NormalizedFootprint,
 } from "./schemas";
 
-export type EasyEda2AllegroApi = {
+export type Easy2AlgApi = {
   getAppInfo: () => Promise<AppApiInfo>;
   getSettings: () => Promise<AppSettings>;
   saveSettings: (settings: AppSettings) => Promise<AppSettings>;

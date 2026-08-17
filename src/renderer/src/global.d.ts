@@ -1,8 +1,8 @@
-import type { EasyEda2AllegroApi } from "../../shared/ipc";
+import type { Easy2AlgApi } from "../../shared/ipc";
 
 declare global {
   interface Window {
-    readonly easyeda2allegro?: EasyEda2AllegroApi;
+    readonly easy2alg?: Easy2AlgApi;
   }
 }
 

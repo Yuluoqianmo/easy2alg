@@ -128,3 +128,25 @@ describe("symbol property panel position", () => {
     expect(again.ui.symbolPropsPosition).toEqual({ x: 120, y: 40 });
   });
 });
+
+/**
+ * 用户 2026-10-27：Allegro 25.1 装好了却存不进设置（旧 schema 是写死的 enum，
+ * 只认到 23.1）。版本号改成"形如 25.1"即可，新版本不用改代码。
+ */
+describe("allegro version", () => {
+  it("accepts versions newer than the built-in list", () => {
+    expect(AppSettingsSchema.parse({ ...minimal, allegroVersion: "25.1" }).allegroVersion).toBe(
+      "25.1",
+    );
+    expect(AppSettingsSchema.parse({ ...minimal, allegroVersion: "26.1" }).allegroVersion).toBe(
+      "26.1",
+    );
+  });
+
+  it("rejects a value that is not a version number", () => {
+    expect(AppSettingsSchema.safeParse({ ...minimal, allegroVersion: "latest" }).success).toBe(
+      false,
+    );
+    expect(AppSettingsSchema.safeParse({ ...minimal, allegroVersion: "25" }).success).toBe(false);
+  });
+});

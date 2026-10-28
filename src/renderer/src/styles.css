@@ -866,6 +866,95 @@ select:focus,
   white-space: nowrap;
 }
 
+/* 「手动选择 / 重新检测」并排放，卡片本身很窄，按钮要收紧一点 */
+.detection-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.detection-card .detection-actions .secondary-button {
+  min-height: 30px;
+  padding: 0 9px;
+  font-size: 10px;
+}
+
+/* 自动更新卡片：左文右按钮，状态用底色区分（有新版本/出错时更显眼） */
+.update-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+  padding: 10px 11px;
+  background: #f7f8fa;
+  border: 1px solid #e2e6ec;
+  border-radius: 8px;
+}
+
+.update-card.available,
+.update-card.downloaded {
+  background: #f1f7ff;
+  border-color: #cfe0f7;
+}
+
+.update-card.error {
+  background: #fff6f5;
+  border-color: #f3d2cd;
+}
+
+.update-copy {
+  min-width: 0;
+}
+
+.update-copy strong,
+.update-copy span {
+  display: block;
+}
+
+.update-copy strong {
+  color: #293642;
+  font-size: 11px;
+}
+
+.update-copy span {
+  margin-top: 3px;
+  color: #687487;
+  font-size: 9px;
+}
+
+.update-copy .update-error {
+  color: #b23c30;
+}
+
+.update-progress {
+  height: 4px;
+  margin-top: 7px;
+  overflow: hidden;
+  background: #e3e8ef;
+  border-radius: 999px;
+}
+
+.update-progress i {
+  display: block;
+  height: 100%;
+  background: #2f6fd0;
+  border-radius: inherit;
+  transition: width 0.2s ease;
+}
+
+.update-card .detection-actions .secondary-button {
+  min-height: 30px;
+  padding: 0 9px;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.top-action.update-action {
+  color: #2f6fd0;
+  background: #f1f7ff;
+  border-color: #cfe0f7;
+}
+
 .modal-backdrop {
   position: fixed;
   inset: 0;
@@ -1143,8 +1232,14 @@ select:focus,
   border-bottom: 1px solid #dfe5ed;
 }
 
-.stage-heading > .stage-tabs {
+/* tabs 与 A/B 分段按钮同属中间那一列：分段按钮必须留在 header 行内，
+ * 不能作为 header 的第 4 个 grid 子项（会掉到第二行、压到画布上）。 */
+.stage-heading > .stage-tabs-group {
   justify-self: center;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
 }
 
 .stage-heading > .edit-toolbar {
@@ -1157,6 +1252,12 @@ select:focus,
   margin: 0;
   color: #172033;
   font-size: 13px;
+}
+
+/* 「封装预览」是固定标题，绝不能被挤成两行（用户 2026-10-23 截图反馈） */
+.stage-heading h2 {
+  flex: none;
+  white-space: nowrap;
 }
 
 .rail-header span,
@@ -1396,6 +1497,16 @@ select:focus,
   line-height: 1.5;
 }
 
+/* 已写入 .olb、但 Capture 缓存着看不到：黄色说明，和"失败"的红字区分开 */
+.rail-item .rail-notice-text {
+  color: #b46b09;
+  white-space: normal;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  line-height: 1.5;
+}
+
 .rail-state {
   color: #13856b;
   transition: opacity 120ms ease;
@@ -1583,6 +1694,17 @@ select:focus,
   display: block;
   color: #8791a2;
   font-size: 9px;
+}
+
+/* Capture 占着 .olb 时的页脚提示：写入会成功，但 Capture 不会自动刷新已打开的库 */
+.stage-footer .footer-lock {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 330px;
+  color: #b46b09;
+  font-size: 10px;
+  line-height: 1.35;
 }
 
 .stage-footer strong {
@@ -2099,18 +2221,29 @@ select:focus,
 
 .stage-sections {
   display: flex;
+  align-items: center;
   gap: 3px;
+  /* 与 tabs 之间用一条细分隔线隔开，表示"这是同一个器件内的分段" */
+  padding-left: 10px;
+  border-left: 1px solid #e2e8f0;
 }
 
 .stage-sections button {
-  width: 24px;
-  height: 24px;
+  width: 22px;
+  height: 22px;
+  padding: 0;
   color: #5f6b7d;
   font-size: 11px;
   font-weight: 700;
   background: #f2f5f9;
   border: 1px solid #d6dde2;
   border-radius: 5px;
+  cursor: pointer;
+}
+
+.stage-sections button:hover {
+  color: #1d49b7;
+  border-color: #2458d3;
 }
 
 .stage-sections button.active {

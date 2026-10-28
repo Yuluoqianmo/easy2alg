@@ -12,6 +12,7 @@ coverage/
 
 # 工具与系统
 .workbuddy/
+.workbuddy-ai/
 *.log
 .DS_Store
 qa-latest.png

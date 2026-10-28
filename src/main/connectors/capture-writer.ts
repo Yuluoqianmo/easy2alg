@@ -11,7 +11,9 @@ import type {
   OlbWriteResult,
 } from "../../shared/schemas";
 import { buildCaptureLibraryXml } from "../conversion/capture-olb";
+import { OLB_REFRESH_HINT } from "../../shared/messages";
 import { writeLog } from "../logging";
+import { captureLockState } from "./capture-lock";
 
 const executeFile = promisify(execFile);
 
@@ -39,23 +41,8 @@ const fileExists = async (path: string): Promise<boolean> => {
 
 /**
  * Capture 的库锁文件：`<库名>lck`（实测 `EASY2ALG.OLBlck`），有的版本写成 `.lck`。
- * 只按同目录、同名（大小写不敏感）匹配，别误伤别的库。
+ * 判定逻辑（含"残留锁"与"Capture 是否真在跑"）见 capture-lock.ts。
  */
-const captureLockFile = async (libraryPath: string): Promise<string | null> => {
-  const directory = dirname(libraryPath);
-  const name = basename(libraryPath).toLowerCase();
-  let entries: string[];
-  try {
-    entries = await readdir(directory);
-  } catch {
-    return null;
-  }
-  const found = entries.find((entry) => {
-    const lower = entry.toLowerCase();
-    return lower === `${name}lck` || lower === `${name}.lck`;
-  });
-  return found === undefined ? null : join(directory, found);
-};
 
 /** Tcl 双引号字符串转义：反斜杠、引号、$ 与 [] 都必须在字面量里失效。 */
 const tclString = (value: string): string =>
@@ -133,6 +120,29 @@ export type CaptureToolchain = {
 };
 
 /**
+ * orDb 的 Tcl 桥接 DLL。
+ *
+ * 17.4 / 23.1 实测都是 `orDb_Dll_Tcl64.dll`，但 Cadence 换过 Tcl 版本号，
+ * 新版本（24.1 / 25.1 及以后）可能叫 `orDb_Dll_Tcl86.dll` 之类。先找准确名字，
+ * 找不到再退回同目录里任何 `orDb_Dll_Tcl<数字>.dll`（取版本号最大的一个），
+ * 否则新版本一装上，写 .olb 就直接报"找不到 tclsh.exe / orDb_Dll_Tcl64.dll"。
+ */
+const findOrDbTclDll = async (binDirectory: string): Promise<string | null> => {
+  const exact = join(binDirectory, "orDb_Dll_Tcl64.dll");
+  if (await fileExists(exact)) {
+    return exact;
+  }
+  try {
+    const names = (await readdir(binDirectory))
+      .filter((name) => /^orDb_Dll_Tcl\d+\.dll$/i.test(name))
+      .sort((left, right) => right.localeCompare(left));
+    return names.length === 0 ? null : join(binDirectory, names[0]);
+  } catch {
+    return null;
+  }
+};
+
+/**
  * 从 allegro.exe 反推 tclsh。
  *
  * 实测 17.4 布局：`<root>/tools/bin/{allegro.exe, tclsh.exe, orDb_Dll_Tcl64.dll}`。
@@ -158,8 +168,11 @@ export const resolveCaptureToolchain = async (
   ];
   for (const candidate of candidates) {
     const tclshPath = join(candidate, "tclsh.exe");
-    const dllPath = join(candidate, "orDb_Dll_Tcl64.dll");
-    if ((await fileExists(tclshPath)) && (await fileExists(dllPath))) {
+    if (!(await fileExists(tclshPath))) {
+      continue;
+    }
+    const dllPath = await findOrDbTclDll(candidate);
+    if (dllPath !== null) {
       return { binDirectory: candidate, tclshPath, dllPath };
     }
   }
@@ -246,15 +259,15 @@ export const inspectLibraryPart = (
   packageName: string,
 ): OlbPartSummary | null => {
   const part = libraryParts(xml).find((item) => item.name === packageName);
-  if (part === undefined) {
-    return null;
-  }
-  return {
-    sectionCount: Math.max((part.body.match(/<LibPart>/g) ?? []).length, 1),
-    pinCount: (part.body.match(/<SymbolPinScalar>/g) ?? []).length,
-    bodyWidth: firstSectionBodyWidth(part.body),
-  };
+  return part === undefined ? null : summarizePart(part.body);
 };
+
+/** 一个 Package 块的概览（段数 / 脚数 / 第 1 段本体宽度）。 */
+const summarizePart = (packageBody: string): OlbPartSummary => ({
+  sectionCount: Math.max((packageBody.match(/<LibPart>/g) ?? []).length, 1),
+  pinCount: (packageBody.match(/<SymbolPinScalar>/g) ?? []).length,
+  bodyWidth: firstSectionBodyWidth(packageBody),
+});
 
 /**
  * 本体宽度 = **第 1 段里第一个 `<Rect>`** 的宽度。
@@ -274,6 +287,35 @@ const firstSectionBodyWidth = (packageBody: string): number | null => {
     Number(new RegExp(`\\b${key}="(-?[\\d.]+)"`).exec(attrs)?.[1] ?? "NaN");
   const [x1, x2] = [num("x1"), num("x2")];
   return Number.isNaN(x1) || Number.isNaN(x2) ? null : Math.abs(x2 - x1);
+};
+
+/**
+ * 一次导出拿到整个库里所有器件的概览（补写队列用：判断这次写入有没有被 Capture 覆盖）。
+ *
+ * 必须整库一次读完：队列里可能压着同一个库的十来个器件，逐器件导出会把
+ * XMATIC_OLB2XML 跑十来遍（每遍几秒）。导出失败（库被删/正在被改写）时返回空表。
+ */
+export const readLibraryParts = async (
+  toolchain: CaptureToolchain,
+  libraryPath: string,
+): Promise<ReadonlyMap<string, OlbPartSummary>> => {
+  const workDirectory = join(tmpdir(), `easy2alg-olb-${randomUUID()}`);
+  await mkdir(workDirectory, { recursive: true });
+  try {
+    const xml = await exportLibrary(toolchain, libraryPath, workDirectory);
+    const parts = new Map<string, OlbPartSummary>();
+    if (xml.length === 0) {
+      return parts;
+    }
+    for (const part of libraryParts(xml)) {
+      if (part.name.length > 0) {
+        parts.set(part.name, summarizePart(part.body));
+      }
+    }
+    return parts;
+  } finally {
+    await rm(workDirectory, { recursive: true, force: true }).catch(() => undefined);
+  }
 };
 
 export type OlbWriteOptions = {
@@ -296,7 +338,7 @@ export type OlbWriteOptions = {
 };
 
 /** 本次要写进去的器件概览（用来和库里的旧内容比对）。 */
-const incomingSummary = (symbol: NormalizedSymbol): OlbPartSummary => {
+export const incomingSummary = (symbol: NormalizedSymbol): OlbPartSummary => {
   const section = symbol.sections[0];
   const rect = section?.shapes.find((shape) => shape.kind === "rect");
   return {
@@ -309,8 +351,32 @@ const incomingSummary = (symbol: NormalizedSymbol): OlbPartSummary => {
   };
 };
 
-const samePart = (a: OlbPartSummary, b: OlbPartSummary): boolean =>
+/** 器件内容是否一致（段数 / 脚数 / 本体宽度）。补写判定也复用它。 */
+export const samePartSummary = (a: OlbPartSummary, b: OlbPartSummary): boolean =>
   a.sectionCount === b.sectionCount && a.pinCount === b.pinCount && a.bodyWidth === b.bodyWidth;
+
+/**
+ * 从导出的库 XML 里取某个器件的引脚名（按出现顺序）。库里没有该器件返回 null。
+ * 只用于"内容是否完全一致"的判定 —— 概览（段数/脚数/宽度）看不出引脚改名。
+ */
+const packagePinNames = (xml: string, packageName: string): string[] | null => {
+  const part = libraryParts(xml).find((item) => item.name === packageName);
+  if (part === undefined) {
+    return null;
+  }
+  return [...part.body.matchAll(/<SymbolPinScalar>\s*<Defn\b([^>]*?)\/>/g)].map(
+    (match) => / name="([^"]*)"/.exec(match[1])?.[1] ?? "",
+  );
+};
+
+const samePinNames = (a: readonly string[], b: readonly string[]): boolean => {
+  if (a.length !== b.length) {
+    return false;
+  }
+  const left = [...a].sort();
+  const right = [...b].sort();
+  return left.every((name, index) => name === right[index]);
+};
 
 const timestamp = (): string => {
   const now = new Date();
@@ -330,17 +396,26 @@ export const writeCaptureLibrary = async (
   options: OlbWriteOptions,
 ): Promise<OlbWriteOutcome> => {
   const { symbol, toolchain, libraryPath } = options;
-  // Capture 打开着库时会留一个 `<库名>lck`（实测 `EASY2ALG.OLBlck`）。此时写进去的内容
-  // 会被 Capture 用内存里的旧内容覆盖；用户甚至会看到"刚删掉的 OLB 又回来了"
-  // （2026-10-19 实际发生），所以直接拒绝并说清原因。
-  const lockPath = await captureLockFile(libraryPath);
-  if (lockPath !== null) {
-    await writeLog("warn", "olb_locked_by_capture", { libraryPath, lockPath });
-    throw new Error(
-      `OrCAD Capture 正打开着这个库（目录里有 ${basename(lockPath)}）。` +
-        `请先在 Capture 里关闭 ${basename(libraryPath)} 再重试 —— ` +
-        `否则 Capture 会把内存里的旧内容写回磁盘，看起来就像删掉的文件又出现了。`,
-    );
+  // Capture 打开着库时会留一个 `<库名>lck`（实测 `EASY2ALG.OLBlck`）。但这个文件只是
+  // Capture 自己的标记，**目标 .olb 并没有被独占**（2026-10-23 实测：同目录里躺着
+  // EASY2ALG.OLBlck 时，对该文件 open(r+b) / rename 全部成功，XMATIC_XML2OLB 也能正常
+  // 导入）。所以这里不再拒绝写入，而是"照写 + 交给调用方登记补写"：
+  //  - 写完 Capture 里看不到（它用的是内存里的旧副本），关掉该库窗口再打开才有；
+  //  - 用户若在 Capture 里保存了该库，会用旧内容覆盖我们的写入 → 由 olb-pending
+  //    在锁消失后自动重放一次，最终结果仍然是我们生成的内容。
+  const lock = await captureLockState(libraryPath);
+  if (lock.blocked) {
+    await writeLog("warn", "olb_locked_by_capture", {
+      libraryPath,
+      lockPath: lock.lockPath,
+      action: "write-through",
+    });
+  } else if (lock.lockPath !== null) {
+    // 崩溃/强杀留下的残留锁：没有 Capture 进程就没人会覆盖，直接当没锁。
+    await writeLog("info", "olb_stale_lock_ignored", {
+      libraryPath,
+      lockPath: lock.lockPath,
+    });
   }
   const existedBefore = await fileExists(libraryPath);
   const mode = existedBefore ? 1 : 0;
@@ -353,11 +428,32 @@ export const writeCaptureLibrary = async (
   // 写入前先看一眼目标库：已有同名器件就必须让用户确认（二次提醒）。
   // 实测 mode 1 会覆盖同名器件，但旧版校验只查名字 —— 旧数据也能通过，
   // 所以这里把"库里的旧内容"和"本次要写的内容"都摆出来给用户看。
+  //
+  // 例外：内容**完全一致**时不问。用户 2026-10-23 的实际情况就是——器件其实早写进去了，
+  // 只是 Capture 缓存着看不到，他以为失败又点了一次，结果弹"已有同名器件，1段9脚 → 1段9脚"，
+  // 更容易让人以为是工具没写。内容一样就没什么可覆盖的，直接重写一遍即可。
   let existing: OlbPartSummary | null = null;
+  let identical = false;
   if (existedBefore) {
     const before = await exportLibrary(toolchain, libraryPath, workDirectory).catch(() => "");
     existing = before.length > 0 ? inspectLibraryPart(before, symbol.name) : null;
-    if (existing !== null && options.confirmOverwrite !== true) {
+    // 概览只比段数/脚数/本体宽度，太粗：改一个引脚名它看不出来。所以再比一遍引脚名，
+    // 只有"概览一致 + 引脚名一致"才算真的相同，才跳过确认。
+    identical =
+      existing !== null &&
+      samePartSummary(existing, incoming) &&
+      samePinNames(
+        packagePinNames(before, symbol.name) ?? [],
+        symbol.sections.flatMap((section) => section.pins.map((pin) => pin.name)),
+      );
+    if (identical) {
+      await writeLog("info", "olb_rewrite_identical", {
+        libraryPath,
+        packageName: symbol.name,
+        summary: JSON.stringify(incoming),
+      });
+    }
+    if (existing !== null && options.confirmOverwrite !== true && !identical) {
       await writeLog("info", "olb_overwrite_needs_confirm", {
         libraryPath,
         packageName: symbol.name,
@@ -479,7 +575,7 @@ export const writeCaptureLibrary = async (
       `OLB 已写入但回读未找到器件 ${symbol.name}，请检查 ${libraryPath}。`,
     );
   }
-  if (!samePart(after, incoming)) {
+  if (!samePartSummary(after, incoming)) {
     await writeLog("error", "olb_verify_stale", {
       libraryPath,
       packageName: symbol.name,
@@ -489,7 +585,9 @@ export const writeCaptureLibrary = async (
     throw new Error(
       `OLB 里 ${symbol.name} 的内容与本次写入不一致（库中 ${after.sectionCount} 段 / ${after.pinCount} 脚，` +
         `本次 ${incoming.sectionCount} 段 / ${incoming.pinCount} 脚）。` +
-        "如果 OrCAD Capture 正开着这个库，请先关闭它再重新生成 —— Capture 会把内存里的旧内容写回去。",
+        (lock.blocked
+          ? "Capture 正好在保存这个库，把旧内容写了回去；已登记补写，关掉该库后会自动重试。"
+          : "请确认该库没有被其它程序（Capture 之外的）打开后重试。"),
     );
   }
 
@@ -518,9 +616,23 @@ export const writeCaptureLibrary = async (
       pinCount: pinned,
       backupPath,
       bytes: fileSize,
-      message: existedBefore
-        ? `已写入 ${basename(libraryPath)}（${symbol.sections.length} 段 / ${pinned} 脚，内容已核对）`
-        : `已新建 ${basename(libraryPath)}（${symbol.sections.length} 段 / ${pinned} 脚）`,
+      // 锁还在 → 调用方（index.ts）据此登记补写；Capture 关掉该库后会自动重放。
+      // 内容本来就一致时不登记：Capture 手里那份和我们要写的完全相同，覆盖也没损失。
+      captureLockPath: lock.blocked ? lock.lockPath : null,
+      pendingWrite: lock.blocked && !identical,
+      identical,
+      previous: existing,
+      message: lock.blocked
+        ? identical
+          ? `${symbol.name} 在 ${basename(libraryPath)} 里已经是这个内容（${symbol.sections.length} 段 / ${pinned} 脚），本次重写了一遍。` +
+            `${OLB_REFRESH_HINT}。`
+          : `已写入 ${basename(libraryPath)}（${symbol.sections.length} 段 / ${pinned} 脚）。` +
+            `${OLB_REFRESH_HINT}；之后会自动补写一次，保存也不会把它冲掉。`
+        : identical
+          ? `${basename(libraryPath)} 里已有完全相同的内容（${symbol.sections.length} 段 / ${pinned} 脚），本次按原样重写了一遍。`
+          : existedBefore
+            ? `已写入 ${basename(libraryPath)}（${symbol.sections.length} 段 / ${pinned} 脚，内容已核对）`
+            : `已新建 ${basename(libraryPath)}（${symbol.sections.length} 段 / ${pinned} 脚）`,
     },
   };
 };

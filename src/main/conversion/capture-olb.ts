@@ -5,7 +5,12 @@ import type {
   NormalizedSymbolShape,
   SymbolPinType,
 } from "../../shared/schemas";
-import { estimateCommentWidth, pinSideOf, symbolFontHeight } from "../../shared/symbol-labels";
+import {
+  bodyBoxOf,
+  estimateCommentWidth,
+  pinSideOf,
+  symbolFontHeight,
+} from "../../shared/symbol-labels";
 import { snapPinsToGrid } from "../../shared/symbol-layout";
 
 /**
@@ -284,22 +289,6 @@ const displayPropCommands = (
   "      </SymbolDisplayProp>",
 ];
 
-/** 本体包围盒：优先用本体 RECT（真实库里 SymbolBBox 就是它，左右伸出的引脚不算）。 */
-const bodyBounds = (
-  section: NormalizedSymbolSection,
-): { minX: number; minY: number; maxX: number; maxY: number } => {
-  const rect = section.shapes.find((shape) => shape.kind === "rect");
-  if (rect === undefined) {
-    return section.bounds;
-  }
-  return {
-    minX: Math.min(rect.min.x, rect.max.x),
-    minY: Math.min(rect.min.y, rect.max.y),
-    maxX: Math.max(rect.min.x, rect.max.x),
-    maxY: Math.max(rect.min.y, rect.max.y),
-  };
-};
-
 const hasVerticalPins = (section: NormalizedSymbolSection): boolean =>
   section.pins.some((pin) => {
     const side = pinSideOf(pin);
@@ -310,7 +299,7 @@ const normalViewCommands = (
   symbol: NormalizedSymbol,
   section: NormalizedSymbolSection,
 ): readonly string[] => {
-  const body = bodyBounds(section);
+  const body = bodyBoxOf(section);
   // 全局旋转规则：**有上下边引脚时必须置 1**，否则它们的名字会被水平画出、
   // 和相邻竖排标签糊在一起。重叠问题由 shared/symbol-layout.ts 的几何避让解决
   // —— 逐脚 PinDisplayProp 那条路实测无效（见该文件注释）。

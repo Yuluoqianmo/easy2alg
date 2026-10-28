@@ -34,6 +34,19 @@ const RawDataStringSchema = z.object({
 });
 const RawResultSchema = z.object({
   dataStr: RawDataStringSchema.optional(),
+  /**
+   * 多子部件器件（双运放 / 双 MOSFET / 四门逻辑 …）的逐段符号。
+   * 这类器件 `dataStr.shape` 为空，真实图形在 `subparts[].dataStr` 里 ——
+   * 解析在 easyeda-symbol.ts，这里只负责把它们带出响应结构（不校验形状）。
+   */
+  subparts: z
+    .array(
+      z.object({
+        title: z.string().optional(),
+        dataStr: z.unknown().optional(),
+      }),
+    )
+    .optional(),
   packageDetail: z.object({
     title: z.string(),
     dataStr: RawDataStringSchema,

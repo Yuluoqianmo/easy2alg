@@ -233,6 +233,15 @@ const widenForVerticalLabels = (
   if (vertical.length === 0) {
     return section;
   }
+  /**
+   * 没有矩形本体（三极管 / MOSFET / 二极管 / 用折线画的连接器）：本体就是图形本身，
+   * 没有"中段"可以让竖脚居中。硬挪只会把引脚从图形上推走 —— C18221391 的漏/源脚
+   * 被推到右边缘、和源数据的接点差一格（用户 2026-10-23 截图）。
+   * 这类符号优先保"引脚端点落在图元上"，标签重叠交给文字避让。
+   */
+  if (!section.shapes.some((shape) => shape.kind === "rect")) {
+    return section;
+  }
   const body = bodyBoxOf(section);
   const leftDepth = sideDepth(section.pins, "left");
   const rightDepth = sideDepth(section.pins, "right");
@@ -310,6 +319,57 @@ const widenForVerticalLabels = (
 export const SYMBOL_PIN_GRID = 10;
 const PIN_GRID = SYMBOL_PIN_GRID;
 
+const gridRemainder = (value: number): number =>
+  ((Math.round(value) % PIN_GRID) + PIN_GRID) % PIN_GRID;
+
+/** 余数 → 位移：往前挪 remainder，或往后挪 10-remainder，取位移小的那个。 */
+const gridDelta = (remainder: number): number => {
+  if (remainder === 0) {
+    return 0;
+  }
+  return remainder <= PIN_GRID / 2 ? -remainder : PIN_GRID - remainder;
+};
+
+const shiftShape = (
+  shape: NormalizedSymbolShape,
+  dx: number,
+  dy: number,
+): NormalizedSymbolShape => {
+  if (shape.kind === "rect") {
+    return {
+      ...shape,
+      min: { x: shape.min.x + dx, y: shape.min.y + dy },
+      max: { x: shape.max.x + dx, y: shape.max.y + dy },
+    };
+  }
+  if (shape.kind === "polyline") {
+    return { ...shape, points: shape.points.map((point) => ({ x: point.x + dx, y: point.y + dy })) };
+  }
+  return { ...shape, at: { x: shape.at.x + dx, y: shape.at.y + dy } };
+};
+
+/** 整段平移（引脚 + 图元 + 包围盒），保证引脚与图形不会相对错位。 */
+const shiftSection = (
+  section: NormalizedSymbolSection,
+  dx: number,
+  dy: number,
+): NormalizedSymbolSection => {
+  if (dx === 0 && dy === 0) {
+    return section;
+  }
+  return {
+    ...section,
+    bounds: {
+      minX: section.bounds.minX + dx,
+      minY: section.bounds.minY + dy,
+      maxX: section.bounds.maxX + dx,
+      maxY: section.bounds.maxY + dy,
+    },
+    pins: section.pins.map((pin) => shiftPin(pin, dx, dy)),
+    shapes: section.shapes.map((shape) => shiftShape(shape, dx, dy)),
+  };
+};
+
 export const alignPinsToGrid = (section: NormalizedSymbolSection): NormalizedSymbolSection => {
   const sides: readonly ("left" | "right" | "top" | "bottom")[] = ["left", "right", "top", "bottom"];
   const shifts = new Map<NormalizedSymbolPin, { dx: number; dy: number }>();
@@ -321,17 +381,15 @@ export const alignPinsToGrid = (section: NormalizedSymbolSection): NormalizedSym
     }
     const vertical = side === "left" || side === "right";
     const values = group.map((pin) => (vertical ? pin.connection.y : pin.connection.x));
-    const remainders = new Set(values.map((value) => ((Math.round(value) % PIN_GRID) + PIN_GRID) % PIN_GRID));
+    const remainders = new Set(values.map(gridRemainder));
     // 间距不是 10 的整数倍（如 0.5mm 间距）→ 整体挪也救不了，跳过
     if (remainders.size !== 1) {
       continue;
     }
-    const remainder = [...remainders][0];
-    if (remainder === 0) {
+    const delta = gridDelta([...remainders][0]);
+    if (delta === 0) {
       continue;
     }
-    // 往前挪 remainder，或往后挪 10-remainder，取位移小的那个
-    const delta = remainder <= PIN_GRID / 2 ? -remainder : PIN_GRID - remainder;
     for (const pin of group) {
       shifts.set(pin, vertical ? { dx: 0, dy: delta } : { dx: delta, dy: 0 });
     }
@@ -340,6 +398,33 @@ export const alignPinsToGrid = (section: NormalizedSymbolSection): NormalizedSym
   if (shifts.size === 0) {
     return section;
   }
+
+  /**
+   * 整段平移优先：引脚和图形必须一起挪。
+   *
+   * 只挪引脚会在引脚与图元之间留一道缝 —— C18221391（MOSFET）的栅极线、漏/源引线
+   * 在预览和导出的 OLB 里都看起来"断开 1 个单位"（用户 2026-10-23 反馈）。
+   * 前提是同一轴上**所有**引脚余数一致：否则整段挪会把本来落在格点上的引脚推歪。
+   */
+  const axisRemainders = (axis: "x" | "y"): Set<number> => {
+    const pins = section.pins.filter((pin) => {
+      const side = pinSideOf(pin);
+      const vertical = side === "top" || side === "bottom";
+      return axis === "x" ? vertical : !vertical;
+    });
+    return new Set(pins.map((pin) => gridRemainder(pin.connection[axis])));
+  };
+  const xRemainders = axisRemainders("x");
+  const yRemainders = axisRemainders("y");
+  if (xRemainders.size <= 1 && yRemainders.size <= 1) {
+    return shiftSection(
+      section,
+      gridDelta([...xRemainders][0] ?? 0),
+      gridDelta([...yRemainders][0] ?? 0),
+    );
+  }
+
+  // 各排余数不一致：只能逐排挪引脚（图形不动），保引脚落格优先
   return {
     ...section,
     pins: section.pins.map((pin) => {

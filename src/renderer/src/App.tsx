@@ -5,6 +5,7 @@ import {
   ChevronRight,
   CircleHelp,
   Clock3,
+  Download,
   FileCode2,
   Focus,
   Folder,
@@ -44,10 +45,9 @@ import {
   type ReactNode,
   type SetStateAction,
 } from "react";
-import type { Easy2AlgApi } from "../../shared/ipc";
+import type { Easy2AlgApi, OlbLockState } from "../../shared/ipc";
 import type {
   AllegroInstall,
-  AllegroVersion,
   AppSettings,
   ConversionPlan,
   ConversionResult,
@@ -64,7 +64,10 @@ import type {
   ProductSearchHit,
   QueueItem,
 } from "../../shared/schemas";
+import { KNOWN_ALLEGRO_VERSIONS } from "../../shared/allegro-version";
+import { OLB_REFRESH_HINT } from "../../shared/messages";
 import { createMockApi } from "./mock-api";
+import { describeUpdate, type UpdateAction, type UpdateState } from "../../shared/update";
 import { PanZoom, type PanZoomHandle } from "./PanZoom";
 import { SymbolGrid } from "./SymbolGrid";
 import { SymbolProperties } from "./SymbolProperties";
@@ -103,6 +106,7 @@ import {
   type EditHistory,
 } from "../../shared/edit-history";
 import { normalizePackageName, sanitizeLibraryName } from "../../shared/naming";
+import { offsetPolygon, polygonPointsAttribute } from "../../shared/pad-geometry";
 import {
   defaultVisibleLayers,
   footprintLayers,
@@ -164,22 +168,32 @@ const createUnavailableApi = (): Easy2AlgApi => {
     chooseOlbLibrary: unavailable,
     createOlbLibrary: unavailable,
     writeOlb: unavailable,
+    getOlbLock: unavailable,
     createPlan: unavailable,
     generate: unavailable,
     onGenerationProgress: () => () => undefined,
     getHistory: unavailable,
     openPath: unavailable,
+    getUpdateState: unavailable,
+    checkForUpdates: unavailable,
+    downloadUpdate: unavailable,
+    installUpdate: unavailable,
+    openReleasePage: unavailable,
+    onUpdateState: () => () => undefined,
   };
 };
 
+// 网页预览：开发模式下跑在 http 上，或构建产物带 `?preview=1`（给文档截图 / 静态托管用）。
+// 打包后的 Electron 里 window.easy2alg 一定存在，会盖过这里，不影响真实运行。
 const isBrowserPreview =
-  import.meta.env.DEV &&
-  (window.location.protocol === "http:" || window.location.protocol === "https:");
+  (import.meta.env.DEV &&
+    (window.location.protocol === "http:" || window.location.protocol === "https:")) ||
+  new URLSearchParams(window.location.search).has("preview");
 const api: Easy2AlgApi =
   window.easy2alg ??
   (isBrowserPreview ? createMockApi() : createUnavailableApi());
 const emptySettings: AppSettings = {
-  allegroVersion: "23.1",
+  allegroVersion: KNOWN_ALLEGRO_VERSIONS[0],
   libraryDirectory: "",
   setupCompleted: false,
   allegroExecutablePath: null,
@@ -189,19 +203,37 @@ const emptySettings: AppSettings = {
   ui: defaultUiSettings(),
 };
 
-const AllegroVersionOptions: readonly {
-  readonly value: AllegroVersion;
-  readonly label: string;
-}[] = [
-  { value: "23.1", label: "Cadence Allegro 23.1" },
-  { value: "22.1", label: "Cadence Allegro 22.1" },
-  { value: "17.4", label: "Cadence Allegro 17.4" },
-  { value: "17.2", label: "Cadence Allegro 17.2" },
-  { value: "16.6", label: "Cadence Allegro 16.6" },
-];
+const errorMessage = (error: unknown): string => {
+  const raw = error instanceof Error ? error.message : String(error);
+  // Electron 会把主进程异常包一层 "Error invoking remote method 'x': TypeError: ..."，
+  // 原样显示给用户全是噪音，剥掉包装只留真正的原因。
+  // 自定义错误类（ExternalServiceError / AllegroExecutionError / FootprintValidationError …）
+  // 同样只是包装名，一并剥掉 —— 用户要看的是"为什么失败"，不是类名。
+  return raw
+    .replace(/^Error invoking remote method '[^']+':\s*/, "")
+    .replace(/^[A-Za-z]*Error:\s*/, "");
+};
 
-const errorMessage = (error: unknown): string =>
-  error instanceof Error ? error.message : String(error);
+/**
+ * 当前生效的 Allegro 程序 —— 与主进程 resolveInstall 保持同一套优先级：
+ * 用户手动选过的程序优先（哪怕版本号和设置里的残留值不一致），其次才是自动探测到的同版本。
+ * 两边不一致会出现"状态栏显示未检测到、点生成却能跑"的鬼故事。
+ */
+const resolveActiveInstall = (
+  settings: AppSettings,
+  installs: readonly AllegroInstall[],
+): AllegroInstall | null => {
+  if (settings.allegroExecutablePath !== null) {
+    const manual = installs.find(
+      (install) =>
+        install.executablePath.toLowerCase() === settings.allegroExecutablePath?.toLowerCase(),
+    );
+    if (manual !== undefined) {
+      return manual;
+    }
+  }
+  return installs.find((install) => install.version === settings.allegroVersion) ?? null;
+};
 
 type SymbolEntry = {
   readonly symbol: NormalizedSymbol;
@@ -295,7 +327,7 @@ const mixColor = (color: string, amount: number): string => {
   return `#${channel(16)}${channel(8)}${channel(0)}`;
 };
 
-const FootprintPreview = ({
+export const FootprintPreview = ({
   footprint,
   visible,
   maskExpansionMm,
@@ -321,29 +353,48 @@ const FootprintPreview = ({
   const strokeOf = (layer: FootprintLayerId): string =>
     layerColors[layer] ?? declared.find((item) => item.id === layer)?.color ?? "#8f9ba8";
 
+  /**
+   * 异形焊盘（`PAD~POLYGON`）必须画真实轮廓 —— 之前一律画 `<rect>`，
+   * 界面上永远是个矩形，用户会以为"没有创建异形焊盘"（2026-10-28 反馈）。
+   * 源数据里 polygon 已经是封装全局坐标（与 pad.center 同一坐标系），
+   * 所以画多边形时**不要**再套 translate/rotate。
+   */
+  const isPolygonPad = (pad: NormalizedFootprint["pads"][number]): boolean =>
+    pad.shape === "polygon" && pad.polygon.length >= 3;
+
   const padOutline = (
     pad: NormalizedFootprint["pads"][number],
     grow: number,
     key: string,
     color: string,
-  ): ReactElement => (
-    <g
-      key={key}
-      transform={`translate(${pad.center.x} ${pad.center.y}) rotate(${pad.rotation})`}
-    >
-      <rect
-        x={-pad.width / 2 - grow}
-        y={-pad.height / 2 - grow}
-        width={pad.width + grow * 2}
-        height={pad.height + grow * 2}
-        rx={pad.shape === "oval" || pad.shape === "circle" ? Math.min(pad.width, pad.height) / 2 : 0}
+  ): ReactElement =>
+    isPolygonPad(pad) ? (
+      <polygon
+        key={key}
+        points={polygonPointsAttribute(offsetPolygon(pad.polygon, grow))}
         fill="none"
         stroke={color}
         strokeWidth="0.04"
         strokeDasharray="0.18 0.12"
       />
-    </g>
-  );
+    ) : (
+      <g
+        key={key}
+        transform={`translate(${pad.center.x} ${pad.center.y}) rotate(${pad.rotation})`}
+      >
+        <rect
+          x={-pad.width / 2 - grow}
+          y={-pad.height / 2 - grow}
+          width={pad.width + grow * 2}
+          height={pad.height + grow * 2}
+          rx={pad.shape === "oval" || pad.shape === "circle" ? Math.min(pad.width, pad.height) / 2 : 0}
+          fill="none"
+          stroke={color}
+          strokeWidth="0.04"
+          strokeDasharray="0.18 0.12"
+        />
+      </g>
+    );
 
   return (
     <>
@@ -377,24 +428,34 @@ const FootprintPreview = ({
           : null}
 
         {visible.has("pads")
-          ? footprint.pads.map((pad) => (
-              <g
-                key={`${pad.number}-${pad.center.x}-${pad.center.y}`}
-                transform={`translate(${pad.center.x} ${pad.center.y}) rotate(${pad.rotation})`}
-              >
-                <rect
-                  x={-pad.width / 2}
-                  y={-pad.height / 2}
-                  width={pad.width}
-                  height={pad.height}
-                  rx={pad.shape === "roundedRectangle" ? Math.min(pad.width, pad.height) * 0.2 : pad.shape === "oval" || pad.shape === "circle" ? Math.min(pad.width, pad.height) / 2 : 0}
-                  // 1 脚提亮一点，方便一眼找到方向（颜色跟随用户自定义的「铜焊盘」色）
+          ? footprint.pads.map((pad) =>
+              isPolygonPad(pad) ? (
+                <polygon
+                  key={`${pad.number}-${pad.center.x}-${pad.center.y}`}
+                  points={polygonPointsAttribute(pad.polygon)}
                   fill={pad.number === "1" ? mixColor(strokeOf("pads"), 0.3) : strokeOf("pads")}
                   stroke={mixColor(strokeOf("pads"), -0.3)}
                   strokeWidth="0.05"
                 />
-              </g>
-            ))
+              ) : (
+                <g
+                  key={`${pad.number}-${pad.center.x}-${pad.center.y}`}
+                  transform={`translate(${pad.center.x} ${pad.center.y}) rotate(${pad.rotation})`}
+                >
+                  <rect
+                    x={-pad.width / 2}
+                    y={-pad.height / 2}
+                    width={pad.width}
+                    height={pad.height}
+                    rx={pad.shape === "roundedRectangle" ? Math.min(pad.width, pad.height) * 0.2 : pad.shape === "oval" || pad.shape === "circle" ? Math.min(pad.width, pad.height) / 2 : 0}
+                    // 1 脚提亮一点，方便一眼找到方向（颜色跟随用户自定义的「铜焊盘」色）
+                    fill={pad.number === "1" ? mixColor(strokeOf("pads"), 0.3) : strokeOf("pads")}
+                    stroke={mixColor(strokeOf("pads"), -0.3)}
+                    strokeWidth="0.05"
+                  />
+                </g>
+              ),
+            )
           : null}
 
         {visible.has("holes") ? (
@@ -517,30 +578,39 @@ const SetupDialog = ({
   initial,
   installs,
   onInstallDetected,
+  onRedetect,
   onSave,
 }: {
   readonly initial: AppSettings;
   readonly installs: readonly AllegroInstall[];
   readonly onInstallDetected: (install: AllegroInstall) => void;
+  readonly onRedetect: () => Promise<void>;
   readonly onSave: (settings: AppSettings) => Promise<void>;
 }): ReactElement => {
-  const configured = installs.find((install) => install.version === initial.allegroVersion);
-  const initialVersion = configured?.version ?? installs[0]?.version ?? initial.allegroVersion;
-  const [version, setVersion] = useState<AllegroVersion>(initialVersion);
+  /**
+   * 版本不让用户从下拉列表里挑（用户 2026-10-27）：能自动识别就用识别结果，
+   * 识别不到才让他手动指定 allegro.exe。默认优先上次用过的版本，其次是最新装的那个
+   * （探测结果已按版本从新到旧排好）。
+   */
   const [directory, setDirectory] = useState(initial.libraryDirectory);
   const [manualExecutablePath, setManualExecutablePath] = useState<string | null>(
-    initialVersion === initial.allegroVersion ? initial.allegroExecutablePath : null,
+    initial.allegroExecutablePath,
   );
+  const [detecting, setDetecting] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const selectedInstall =
-    (manualExecutablePath === null
-      ? installs.find((install) => install.version === version)
-      : installs.find(
+  const manualInstall =
+    manualExecutablePath === null
+      ? null
+      : (installs.find(
           (install) =>
-            install.version === version &&
             install.executablePath.toLowerCase() === manualExecutablePath.toLowerCase(),
-        )) ?? null;
+        ) ?? null);
+  const selectedInstall =
+    manualInstall ??
+    installs.find((install) => install.version === initial.allegroVersion) ??
+    installs[0] ??
+    null;
 
   const chooseDirectory = async (): Promise<void> => {
     const selected = await api.chooseLibraryDirectory();
@@ -548,19 +618,36 @@ const SetupDialog = ({
       setDirectory(selected);
     }
   };
+  const redetect = async (): Promise<void> => {
+    setDetecting(true);
+    setError(null);
+    try {
+      await onRedetect();
+      // 手动选过的程序可能装在非标准目录，重新扫描扫不到 —— 补回列表，
+      // 否则"手动选择"完再点"重新检测"，选择就凭空消失了。
+      if (manualInstall !== null) {
+        onInstallDetected(manualInstall);
+      }
+    } catch (detectError) {
+      setError(errorMessage(detectError));
+    } finally {
+      setDetecting(false);
+    }
+  };
   const save = async (): Promise<void> => {
+    if (selectedInstall === null) {
+      return;
+    }
     setSaving(true);
     setError(null);
     try {
       await onSave({
-        allegroVersion: version,
+        ...initial,
+        allegroVersion: selectedInstall.version,
+        // 自动识别的就不写死路径：以后换版本、换安装位置都能跟着重新识别
+        allegroExecutablePath: manualInstall === null ? null : manualInstall.executablePath,
         libraryDirectory: directory,
         setupCompleted: true,
-        allegroExecutablePath: manualExecutablePath,
-        olbLibraryPath: initial.olbLibraryPath,
-        unifiedLibraryFolder: initial.unifiedLibraryFolder,
-        fillPcbFootprint: initial.fillPcbFootprint,
-        ui: initial.ui,
       });
     } catch (saveError) {
       setError(errorMessage(saveError));
@@ -574,7 +661,6 @@ const SetupDialog = ({
       const install = await api.chooseAllegroExecutable();
       if (install !== null) {
         onInstallDetected(install);
-        setVersion(install.version);
         setManualExecutablePath(install.executablePath);
       }
     } catch (chooseError) {
@@ -587,38 +673,46 @@ const SetupDialog = ({
         <div className="setup-mark"><Zap size={25} /></div>
         <p className="eyebrow">安装检查</p>
         <h2>确认真实的 Allegro</h2>
-        <p className="muted">只有检测到实际程序后才能生成封装，不再使用默认连接状态。</p>
-        <label className="field-label" htmlFor="setup-version">Allegro 版本</label>
-        <select
-          id="setup-version"
-          value={version}
-          onChange={(event) => {
-            setVersion(event.target.value as AllegroVersion);
-            setManualExecutablePath(null);
-          }}
-        >
-          {AllegroVersionOptions.map((option) => (
-            <option value={option.value} key={option.value}>
-              {option.label}
-              {installs.some((install) => install.version === option.value) ? "（已检测）" : ""}
-            </option>
-          ))}
-        </select>
+        <p className="muted">
+          自动识别电脑上已安装的 Allegro，识别不到时再手动指定 allegro.exe。
+          只有找到实际程序后才能生成封装。
+        </p>
+        <label className="field-label">Allegro 程序</label>
         <div className={`detection-card ${selectedInstall === null ? "missing" : ""}`}>
           {selectedInstall === null ? (
             <>
               <TriangleAlert size={18} />
-              <div><strong>未检测到 Allegro {version}</strong><span>可以选择实际的 allegro.exe</span></div>
+              <div>
+                <strong>未自动识别到 Allegro</strong>
+                <span>请手动选择安装目录下的 tools\bin\allegro.exe</span>
+              </div>
             </>
           ) : (
             <>
               <Check size={18} />
-              <div><strong>已检测 Allegro {selectedInstall.version}</strong><span>{selectedInstall.executablePath}</span></div>
+              <div>
+                <strong>已识别 Allegro {selectedInstall.version}</strong>
+                <span>{selectedInstall.executablePath}</span>
+              </div>
             </>
           )}
-          <button type="button" className="secondary-button" onClick={() => void chooseExecutable()}>
-            手动选择
-          </button>
+          <div className="detection-actions">
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => void chooseExecutable()}
+            >
+              手动选择
+            </button>
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => void redetect()}
+              disabled={detecting}
+            >
+              {detecting ? "检测中…" : "重新检测"}
+            </button>
+          </div>
         </div>
         {error === null ? null : <p className="setup-error">{error}</p>}
         <label className="field-label" htmlFor="setup-directory">封装库目录</label>
@@ -923,6 +1017,11 @@ const ConverterPage = ({
   const [previewTab, setPreviewTab] = useState<"pcb" | "sch">("pcb");
   const [sectionIndex, setSectionIndex] = useState(0);
   /**
+   * 目标 .olb 是否正被 Capture 打开着。生成前先摆出来 —— Capture 不会自动刷新已打开的库，
+   * 写进去也看不到，用户会以为工具没生成（2026-10-23 实际发生）。
+   */
+  const [olbLock, setOlbLock] = useState<OlbLockState | null>(null);
+  /**
    * 符号编辑的**选中集**：支持多选（空白处拖出橡皮筋框选，然后一起移动 ——
    * 用户 2026-10-16 要求）。单选就是长度为 1。
    */
@@ -1064,6 +1163,23 @@ const ConverterPage = ({
       setPreviewTab("pcb");
     }
   }, [hasSymbol]);
+
+  // 目标 .olb 被 Capture 占着时提前提示：写进去也看不到，得关掉该库再打开。
+  // 换了库路径要重新判定（设置里改过 olbLibraryPath）。
+  useEffect(() => {
+    let cancelled = false;
+    void api
+      .getOlbLock()
+      .then((state) => {
+        if (!cancelled) {
+          setOlbLock(state);
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [settings.olbLibraryPath]);
 
   /**
    * 符号条目自愈：选中的器件在 symbols 表里缺条目时自动补拉一次。
@@ -2089,10 +2205,15 @@ const ConverterPage = ({
       const notes: string[] = [];
       let pcbFailure: string | null = null;
       let pcbResult: ConversionResult | null = null;
+      // 原理图元件写进去了，但 Capture 正打开着这个库 → 列表里必须显式提示，
+      // 否则"生成完却在 Capture 里找不到"会被当成失败（用户 2026-10-23 实际踩到）。
+      let olbPending: string | null = null;
 
       updateItem(item.id, {
         state: "loading",
         message: wantPcb ? "Allegro 正在生成并检查…" : "正在写入原理图元件库（.olb）…",
+        // 清掉上一轮留下的行内提示（updateItem 是浅合并，不清会一直挂着）
+        notice: undefined,
       });
 
       // ① PCB 封装（.dra/.psm/.pad）
@@ -2130,6 +2251,11 @@ const ConverterPage = ({
             libraryName: entry.libraryName,
             // 跟随界面磁吸开关（用户 2026-10-20）：关掉后写库按实际坐标，仍取整
             snapPins: settings.ui.symbolSnapEnabled,
+            // 用户 2026-10-23：只生成原理图元件时不填 PCB Footprint 字段 ——
+            // 这次没生成封装，写进去的封装名对不上任何 .dra，反而误导。
+            // 三个条件都要满足：设置里允许填、勾了 PCB 封装、这个器件确实有封装计划
+            // （plan 为 null 时即使勾了 PCB 也不会产出 .dra，见上面 ① 的判断）。
+            fillPcbFootprint: settings.fillPcbFootprint && wantPcb && plan !== null,
           };
           let outcome = await api.writeOlb(request);
           // 库里已有同名器件 → 二次确认后再覆盖（用户 2026-10-16 要求）。
@@ -2157,6 +2283,12 @@ const ConverterPage = ({
               [item.id]: { status: "ok", result: outcome.result },
             }));
             notes.push(outcome.result.message);
+            if (outcome.result.pendingWrite === true) {
+              olbPending = OLB_REFRESH_HINT;
+            } else if (outcome.result.captureLockPath !== null && outcome.result.captureLockPath !== undefined) {
+              // 内容本来就一致、没登记补写：同样要说明"Capture 里看不到不是没写进去"
+              olbPending = OLB_REFRESH_HINT;
+            }
           }
         } catch (error) {
           const message = errorMessage(error);
@@ -2175,6 +2307,7 @@ const ConverterPage = ({
         updateItem(item.id, {
           state: "generationFailed",
           message: `上次生成失败，可直接重试：${pcbFailure}`,
+          notice: undefined,
         });
         if (wantPcb && pcbResult === null) {
           const previousProgress = progressRef.current;
@@ -2190,8 +2323,11 @@ const ConverterPage = ({
           progressRef.current = failedProgress;
           setProgress(failedProgress);
         }
+      } else if (olbPending !== null) {
+        // 黄灯而不是绿灯：文件确实写好了，但 Capture 里还看不到，需要用户做一步操作。
+        updateItem(item.id, { state: "warning", message: notes.join(""), notice: olbPending });
       } else {
-        updateItem(item.id, { state: "generated", message: notes.join("") });
+        updateItem(item.id, { state: "generated", message: notes.join(""), notice: undefined });
       }
       if (pcbResult !== null) {
         onGenerated({ ...pcbResult, id: `${pcbResult.lcscId}-${pcbResult.completedAt}` });
@@ -2200,6 +2336,8 @@ const ConverterPage = ({
     } finally {
       // 任何一步抛出来都不能把 running 卡在 true —— 那会让按钮永远灰着（用户 2026-10-19）
       setRunning(false);
+      // 这一轮里用户可能顺手把 Capture 的库关了，提示跟着刷新
+      void api.getOlbLock().then(setOlbLock).catch(() => undefined);
     }
   };
 
@@ -2420,7 +2558,10 @@ const ConverterPage = ({
                   <strong>{item.id}</strong><small>{item.footprint?.info.name ?? ""}</small>
                   {/* 失败时必须让用户看到原因（2026-10-19：Capture 占着库导致写入被拒，
                    * 但 em 槽位被封装名占着，错误文本根本显示不出来，用户只看到红 X） */}
-                  {item.state === "error" || item.state === "generationFailed" ? (
+                  {item.notice !== undefined ? (
+                    // 已写入但 Capture 里看不到：用黄字说明，别让用户以为没生成
+                    <em className="rail-notice-text" title={item.message}>{item.notice}</em>
+                  ) : item.state === "error" || item.state === "generationFailed" ? (
                     <em className="rail-error-text" title={item.message}>{item.message}</em>
                   ) : (
                     <em>
@@ -2489,30 +2630,53 @@ const ConverterPage = ({
                     ? "请选择器件"
                     : normalizePackageName(selected.footprint.info.sourcePackageName)}
                 </span></div>
-          <div className="stage-tabs" role="tablist">
-            <button
-              type="button"
-              role="tab"
-              aria-selected={previewTab === "pcb"}
-              className={previewTab === "pcb" ? "active" : ""}
-              onClick={() => setPreviewTab("pcb")}
-              disabled={selected?.footprint === null || selected?.footprint === undefined}
-              data-testid="tab-pcb"
-            >
-              PCB 封装
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={previewTab === "sch"}
-              className={previewTab === "sch" ? "active" : ""}
-              onClick={() => setPreviewTab("sch")}
-              disabled={editedSymbol === null}
-              title={editedSymbol === null ? "该器件的源数据里没有原理图元件" : undefined}
-              data-testid="tab-sch"
-            >
-              原理图元件
-            </button>
+          <div className="stage-tabs-group">
+            <div className="stage-tabs" role="tablist">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={previewTab === "pcb"}
+                className={previewTab === "pcb" ? "active" : ""}
+                onClick={() => setPreviewTab("pcb")}
+                disabled={selected?.footprint === null || selected?.footprint === undefined}
+                data-testid="tab-pcb"
+              >
+                PCB 封装
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={previewTab === "sch"}
+                className={previewTab === "sch" ? "active" : ""}
+                onClick={() => setPreviewTab("sch")}
+                disabled={editedSymbol === null}
+                title={editedSymbol === null ? "该器件的源数据里没有原理图元件" : undefined}
+                data-testid="tab-sch"
+              >
+                原理图元件
+              </button>
+            </div>
+            {/* 多子部件器件（双 MOSFET / 双运放）的 A/B 段切换。
+             * 必须跟 tabs 同一行：以前它是 header 的第 4 个 grid 子项，被挤到第二行、
+             * 掉出 52px 的 header 压在画布上（用户 2026-10-23 截图反馈）。 */}
+            {previewTab === "sch" && editedSymbol !== null && editedSymbol.sections.length > 1 ? (
+              <div className="stage-sections" aria-label="符号分段" title="多段器件：切换 A / B 段">
+                {editedSymbol.sections.map((section, index) => (
+                  <button
+                    key={section.name}
+                    type="button"
+                    className={index === sectionIndex ? "active" : ""}
+                    onClick={() => {
+                      setSectionIndex(index);
+                      setSelectedKeys([]);
+                    }}
+                    title={section.name}
+                  >
+                    {String.fromCharCode(65 + (index % 26))}
+                  </button>
+                ))}
+              </div>
+            ) : null}
           </div>
           {previewTab === "sch" && editedSymbol !== null ? (
             <div className="edit-toolbar">
@@ -2556,24 +2720,6 @@ const ConverterPage = ({
               >
                 <Redo2 size={15} />
               </button>
-            </div>
-          ) : null}
-          {previewTab === "sch" && editedSymbol !== null && editedSymbol.sections.length > 1 ? (
-            <div className="stage-sections" aria-label="符号分段">
-              {editedSymbol.sections.map((section, index) => (
-                <button
-                  key={section.name}
-                  type="button"
-                  className={index === sectionIndex ? "active" : ""}
-                  onClick={() => {
-                    setSectionIndex(index);
-                    setSelectedKeys([]);
-                  }}
-                  title={section.name}
-                >
-                  {String.fromCharCode(65 + (index % 26))}
-                </button>
-              ))}
             </div>
           ) : null}
         </header>
@@ -2814,7 +2960,22 @@ const ConverterPage = ({
           ) : null}
         </div>
         <footer className="stage-footer">
-          <div><span>ALLEGRO 库目录</span><strong><Folder size={14} />{settings.libraryDirectory}</strong></div>
+          <div>
+            <span>ALLEGRO 库目录</span>
+            <strong><Folder size={14} />{settings.libraryDirectory}</strong>
+          </div>
+          {olbLock !== null && olbLock.blocked && (
+            // Capture 没有"重新加载库"的接口，只能关掉该库再打开。提前说清楚，
+            // 免得生成完在 Capture 里找不到又被当成失败（用户 2026-10-23）。
+            <div
+              className="footer-lock"
+              data-testid="olb-lock-hint"
+              title={`${olbLock.libraryPath ?? ""} 正被 OrCAD Capture 打开。写入会成功，但 Capture 不会自动刷新已打开的库：刷新或重新打开该库即可看到。`}
+            >
+              <TriangleAlert size={13} />
+              <span>{OLB_REFRESH_HINT}</span>
+            </div>
+          )}
           <div className="generation-side">
             <div className="target-toggles">
               <label title="生成 Allegro 封装：.dra / .psm / .pad">
@@ -2961,8 +3122,30 @@ const ConverterPage = ({
                 </div>
               ) : selectedOlb.status === "ok" ? (
                 <>
-                  <div className="model-row"><Check size={15} className="green-icon" />{selectedOlb.result.message}</div>
+                  <div className="model-row">
+                    {selectedOlb.result.pendingWrite === true ||
+                    selectedOlb.result.captureLockPath != null ? (
+                      <TriangleAlert size={15} className="warning-icon" />
+                    ) : (
+                      <Check size={15} className="green-icon" />
+                    )}
+                    {selectedOlb.result.message}
+                  </div>
                   <div className="model-row"><span className="muted">{selectedOlb.result.libraryPath}</span></div>
+                  {selectedOlb.result.pendingWrite === true && (
+                    // 库被 Capture 占着：内容已经落盘，但 Capture 用的是内存里的旧副本。
+                    // 关掉这个库后由主进程自动补写一次，用户不需要再做别的。
+                    <div className="model-row">
+                      <span className="muted">已在后台登记补写：Capture 关掉该库后自动重放，不会丢。</span>
+                    </div>
+                  )}
+                  {selectedOlb.result.pendingWrite !== true &&
+                    selectedOlb.result.captureLockPath != null && (
+                      // 内容本来就一致，没什么可补的 —— 只是 Capture 里看不到
+                      <div className="model-row">
+                        <span className="muted">库内容没有变化，无需补写；{OLB_REFRESH_HINT}。</span>
+                      </div>
+                    )}
                 </>
               ) : (
                 <div className="model-row"><TriangleAlert size={15} className="warning-icon" />{selectedOlb.message}</div>
@@ -3051,29 +3234,131 @@ const HistoryPage = ({
   </main>
 );
 
+/**
+ * 自动更新卡片（设置页）。
+ *
+ * 状态全部由主进程维护、App 订阅后传下来，这里只负责点按钮和显示错误 ——
+ * 界面不再自己记一份"下载到哪了"，免得和主进程的实际状态对不上。
+ */
+const UpdateCard = ({ state }: { readonly state: UpdateState | null }): ReactElement => {
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const summary = state === null ? null : describeUpdate(state);
+  const action = summary?.action ?? null;
+  const percent = Math.max(0, Math.min(100, Math.round(state?.percent ?? 0)));
+  const run = async (next: UpdateAction): Promise<void> => {
+    setError(null);
+    setBusy(true);
+    try {
+      if (next === "check") {
+        await api.checkForUpdates();
+      } else if (next === "download") {
+        await api.downloadUpdate();
+      } else if (next === "install") {
+        await api.installUpdate();
+      } else {
+        await api.openReleasePage();
+      }
+    } catch (actionError) {
+      setError(errorMessage(actionError));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="setting-section">
+      <div className="setting-icon"><Download size={21} /></div>
+      <div className="setting-content">
+        <label>软件更新</label>
+        <p>启动时自动检查新版本，下载完成后重启软件即可安装。</p>
+        <div className={`update-card ${state?.status ?? "idle"}`}>
+          <div className="update-copy">
+            <strong>{summary?.title ?? "读取版本信息…"}</strong>
+            <span>{summary?.detail ?? ""}</span>
+            {state?.status === "downloading" ? (
+              <div
+                className="update-progress"
+                role="progressbar"
+                aria-valuenow={percent}
+                aria-valuemin={0}
+                aria-valuemax={100}
+              >
+                <i style={{ width: `${percent}%` }} />
+              </div>
+            ) : null}
+            {error === null ? null : <span className="update-error">{error}</span>}
+          </div>
+          <div className="detection-actions">
+            {action === null ? null : (
+              <button
+                type="button"
+                className="secondary-button"
+                disabled={busy || summary?.busy === true}
+                onClick={() => void run(action)}
+                data-testid="update-action"
+              >
+                {summary?.actionLabel}
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const SettingsPage = ({
   settings,
   installs,
+  update,
   onInstallDetected,
+  onRedetect,
   onSave,
 }: {
   readonly settings: AppSettings;
   readonly installs: readonly AllegroInstall[];
+  readonly update: UpdateState | null;
   readonly onInstallDetected: (install: AllegroInstall) => void;
+  readonly onRedetect: () => Promise<void>;
   readonly onSave: (settings: AppSettings) => Promise<void>;
 }): ReactElement => {
   const [draft, setDraft] = useState(settings);
   const [saved, setSaved] = useState(false);
+  const [detecting, setDetecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const selectedInstall =
-    (draft.allegroExecutablePath === null
-      ? installs.find((install) => install.version === draft.allegroVersion)
-      : installs.find(
+  /**
+   * 版本同样是自动识别出来的，不再给下拉列表（用户 2026-10-27）：
+   * 手动选过的程序优先，其次上次保存的版本，最后退到最新装的那个。
+   */
+  const manualInstall =
+    draft.allegroExecutablePath === null
+      ? null
+      : (installs.find(
           (install) =>
-            install.version === draft.allegroVersion &&
             install.executablePath.toLowerCase() ===
-              draft.allegroExecutablePath?.toLowerCase(),
-        )) ?? null;
+            draft.allegroExecutablePath?.toLowerCase(),
+        ) ?? null);
+  const selectedInstall =
+    manualInstall ??
+    installs.find((install) => install.version === draft.allegroVersion) ??
+    installs[0] ??
+    null;
+  const redetect = async (): Promise<void> => {
+    setDetecting(true);
+    setError(null);
+    try {
+      await onRedetect();
+      // 手动选过的程序可能装在非标准目录，重新扫描扫不到 —— 补回列表
+      if (manualInstall !== null) {
+        onInstallDetected(manualInstall);
+      }
+      setSaved(false);
+    } catch (detectError) {
+      setError(errorMessage(detectError));
+    } finally {
+      setDetecting(false);
+    }
+  };
   const choose = async (): Promise<void> => {
     const selected = await api.chooseLibraryDirectory();
     if (selected !== null) {
@@ -3120,9 +3405,18 @@ const SettingsPage = ({
     }
   };
   const save = async (): Promise<void> => {
+    if (selectedInstall === null) {
+      return;
+    }
     setError(null);
     try {
-      await onSave({ ...draft, setupCompleted: true });
+      await onSave({
+        ...draft,
+        allegroVersion: selectedInstall.version,
+        // 自动识别的就不写死路径：以后换版本、换安装位置都能跟着重新识别
+        allegroExecutablePath: manualInstall === null ? null : manualInstall.executablePath,
+        setupCompleted: true,
+      });
       setSaved(true);
       window.setTimeout(() => setSaved(false), 1800);
     } catch (saveError) {
@@ -3142,55 +3436,44 @@ const SettingsPage = ({
         <div className="setting-section">
           <div className="setting-icon"><Zap size={21} /></div>
           <div className="setting-content">
-            <label htmlFor="allegro-version">Allegro 版本</label>
-            <p>选择电脑上已经安装的版本。</p>
-            <select
-              id="allegro-version"
-              value={draft.allegroVersion}
-              onChange={(event) => {
-                setDraft({
-                  ...draft,
-                  allegroVersion: event.target.value as AllegroVersion,
-                  allegroExecutablePath: null,
-                });
-                setSaved(false);
-              }}
-            >
-              {AllegroVersionOptions.map((option) => (
-                <option value={option.value} key={option.value}>
-                  {option.label}
-                  {installs.some((install) => install.version === option.value)
-                    ? "（已检测）"
-                    : ""}
-                </option>
-              ))}
-            </select>
+            <label>Allegro 程序</label>
+            <p>自动识别电脑上已安装的 Allegro；识别不到时再手动指定 allegro.exe。</p>
             <div className={`detection-card ${selectedInstall === null ? "missing" : ""}`}>
               {selectedInstall === null ? (
                 <>
                   <TriangleAlert size={18} />
                   <div>
-                    <strong>未检测到 Allegro {draft.allegroVersion}</strong>
-                    <span>请确认版本，或选择实际的 allegro.exe</span>
+                    <strong>未自动识别到 Allegro</strong>
+                    <span>请手动选择安装目录下的 tools\bin\allegro.exe</span>
                   </div>
                 </>
               ) : (
                 <>
                   <Check size={18} />
                   <div>
-                    <strong>已检测 Allegro {selectedInstall.version}</strong>
+                    <strong>已识别 Allegro {selectedInstall.version}</strong>
                     <span>{selectedInstall.executablePath}</span>
                   </div>
                 </>
               )}
-              <button
-                type="button"
-                className="secondary-button"
-                onClick={() => void chooseExecutable()}
-                data-testid="choose-allegro-executable"
-              >
-                手动选择
-              </button>
+              <div className="detection-actions">
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => void chooseExecutable()}
+                  data-testid="choose-allegro-executable"
+                >
+                  手动选择
+                </button>
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => void redetect()}
+                  disabled={detecting}
+                >
+                  {detecting ? "检测中…" : "重新检测"}
+                </button>
+              </div>
             </div>
           </div>
         </div>
@@ -3280,10 +3563,11 @@ const SettingsPage = ({
                 onChange={(event) => setDraft({ ...draft, fillPcbFootprint: event.target.checked })}
                 data-testid="setting-fill-footprint"
               />
-              <span>在 .olb 的器件里填入 PCB Footprint 字段</span>
+              <span>在 .olb 的器件里填入 PCB Footprint 字段（仅同时生成 PCB 封装时生效）</span>
             </label>
           </div>
         </div>
+        <UpdateCard state={update} />
         <div className="settings-actions">
           <span className={error === null ? "" : "settings-error"}>
             {error ?? (saved ? "已保存" : "")}
@@ -3314,6 +3598,8 @@ export const App = (): ReactElement => {
   const [installs, setInstalls] = useState<readonly AllegroInstall[]>([]);
   const [ready, setReady] = useState(false);
   const [fatalError, setFatalError] = useState<string | null>(null);
+  /** 自动更新状态：主进程推过来的唯一一份，设置页与顶栏共用。 */
+  const [update, setUpdate] = useState<UpdateState | null>(null);
 
   useEffect(() => {
     Promise.all([api.getSettings(), api.getHistory(), api.detectAllegro()])
@@ -3329,21 +3615,28 @@ export const App = (): ReactElement => {
       });
   }, []);
 
+  useEffect(() => {
+    let alive = true;
+    void api
+      .getUpdateState()
+      .then((state) => {
+        if (alive) setUpdate(state);
+      })
+      .catch(() => undefined);
+    const unsubscribe = api.onUpdateState((state) => setUpdate(state));
+    return () => {
+      alive = false;
+      unsubscribe();
+    };
+  }, []);
+
   const selectedReady = useMemo(
     () => queue.filter((item) => item.selected && item.state !== "error").length,
     [queue],
   );
   const activeInstall = useMemo(
-    () =>
-      (settings.allegroExecutablePath === null
-        ? installs.find((install) => install.version === settings.allegroVersion)
-        : installs.find(
-            (install) =>
-              install.version === settings.allegroVersion &&
-              install.executablePath.toLowerCase() ===
-                settings.allegroExecutablePath?.toLowerCase(),
-          )) ?? null,
-    [installs, settings.allegroExecutablePath, settings.allegroVersion],
+    () => resolveActiveInstall(settings, installs),
+    [installs, settings],
   );
   const addInstall = (install: AllegroInstall): void => {
     setInstalls((current) => [
@@ -3357,6 +3650,10 @@ export const App = (): ReactElement => {
   const saveSettings = async (nextSettings: AppSettings): Promise<void> => {
     const saved = await api.saveSettings(nextSettings);
     setSettings(saved);
+    setInstalls(await api.detectAllegro());
+  };
+  /** 重新扫描一次安装（用户装完 Allegro 不用重启软件）。 */
+  const redetect = async (): Promise<void> => {
     setInstalls(await api.detectAllegro());
   };
   /**
@@ -3403,6 +3700,19 @@ export const App = (): ReactElement => {
           <button className="top-action" type="button" onClick={() => setPage("settings")} data-testid="nav-settings">
             <Settings size={17} />设置
           </button>
+          {update !== null &&
+          (update.status === "available" || update.status === "downloaded") ? (
+            <button
+              className="top-action update-action"
+              type="button"
+              onClick={() => setPage("settings")}
+              data-testid="nav-update"
+              title={update.status === "downloaded" ? "更新已下载，重启即可安装" : "发现新版本"}
+            >
+              <Download size={17} />
+              {update.status === "downloaded" ? "可安装更新" : `新版本 v${update.latestVersion ?? ""}`}
+            </button>
+          ) : null}
           <button className="top-action" type="button">
             <CircleHelp size={17} />帮助
           </button>
@@ -3430,7 +3740,9 @@ export const App = (): ReactElement => {
         <SettingsPage
           settings={settings}
           installs={installs}
+          update={update}
           onInstallDetected={addInstall}
+          onRedetect={redetect}
           onSave={saveSettings}
         />
       )}
@@ -3450,6 +3762,7 @@ export const App = (): ReactElement => {
           initial={settings}
           installs={installs}
           onInstallDetected={addInstall}
+          onRedetect={redetect}
           onSave={saveSettings}
         />
       ) : null}

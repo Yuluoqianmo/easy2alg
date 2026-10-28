@@ -13,6 +13,7 @@ import type {
   ProductSearchResult,
   UiSettingsPatch,
 } from "./schemas";
+import type { UpdateState } from "./update";
 
 export type OlbWriteRequest = {
   readonly symbol: NormalizedSymbol;
@@ -27,6 +28,25 @@ export type OlbWriteRequest = {
    * 省略 = true（老行为）；false 时按实际坐标写入，但仍会取整成整数（XSD 要求）。
    */
   readonly snapPins?: boolean;
+  /**
+   * 是否把 PCB 封装名写进器件的 PCB Footprint 字段。
+   * 省略 = 跟随设置里的全局开关。用户 2026-10-23：只生成原理图元件时这个字段
+   * 应该留空（封装名此时没有意义），所以调用方会传「全局开关 && 勾了 PCB」。
+   */
+  readonly fillPcbFootprint?: boolean;
+};
+
+/**
+ * 目标 .olb 此刻是否被 OrCAD Capture 打开着。
+ *
+ * 用途：生成前就告诉用户"写进去也看不到，得关掉该库再打开"，避免把"Capture 没刷新"
+ * 误判成"工具没写"（用户 2026-10-23 实际踩到）。
+ */
+export type OlbLockState = {
+  readonly libraryPath: string | null;
+  readonly lockPath: string | null;
+  /** true = 锁文件在且 Capture 在跑（残留锁不算） */
+  readonly blocked: boolean;
 };
 
 export type Easy2AlgApi = {
@@ -57,11 +77,21 @@ export type Easy2AlgApi = {
   chooseOlbLibrary: () => Promise<string | null>;
   createOlbLibrary: (suggestedName: string) => Promise<string | null>;
   writeOlb: (request: OlbWriteRequest) => Promise<OlbWriteOutcome>;
+  /** 目标 .olb 是否被 Capture 打开着（生成前提示用） */
+  getOlbLock: () => Promise<OlbLockState>;
   createPlan: (footprint: NormalizedFootprint) => Promise<ConversionPlan>;
   generate: (plan: ConversionPlan) => Promise<ConversionResult>;
   onGenerationProgress: (listener: (progress: GenerationProgress) => void) => () => void;
   getHistory: () => Promise<HistoryEntry[]>;
   openPath: (absolutePath: string) => Promise<void>;
+  /** 自动更新：当前状态（界面打开设置页时先拉一次） */
+  getUpdateState: () => Promise<UpdateState>;
+  checkForUpdates: () => Promise<UpdateState>;
+  downloadUpdate: () => Promise<UpdateState>;
+  installUpdate: () => Promise<void>;
+  openReleasePage: () => Promise<void>;
+  /** 订阅更新状态变化（检查中 / 有新版本 / 下载进度 / 下载完成 / 出错） */
+  onUpdateState: (listener: (state: UpdateState) => void) => () => void;
 };
 
 export const IpcChannels = {
@@ -82,9 +112,16 @@ export const IpcChannels = {
   chooseOlbLibrary: "dialog:choose-olb-library",
   createOlbLibrary: "dialog:create-olb-library",
   writeOlb: "olb:write",
+  getOlbLock: "olb:lock-state",
   createPlan: "conversion:create-plan",
   generate: "conversion:generate",
   generationProgress: "conversion:progress",
   getHistory: "history:get",
   openPath: "shell:open-path",
+  getUpdateState: "updater:get-state",
+  checkForUpdates: "updater:check",
+  downloadUpdate: "updater:download",
+  installUpdate: "updater:install",
+  openReleasePage: "updater:open-release",
+  updateState: "updater:state",
 } as const;

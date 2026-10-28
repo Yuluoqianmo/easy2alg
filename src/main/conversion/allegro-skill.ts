@@ -7,6 +7,13 @@ import type {
   NormalizedPad,
   Point,
 } from "../../shared/schemas";
+import {
+  localPadPolygon,
+  normalizePolygon,
+  offsetPolygon,
+  polygonBounds,
+  scalePolygon,
+} from "./geometry";
 import { derivePadstackName } from "./naming";
 
 export type AllegroSourceFile = {
@@ -18,6 +25,14 @@ export type AllegroSourceBundle = {
   readonly symbolName: string;
   readonly sources: readonly AllegroSourceFile[];
   readonly expectedOutputs: readonly string[];
+  /**
+   * 先跑一遍的"生成 shape symbol"脚本（没有异形焊盘时为 null）。
+   * 异形焊盘（POLYGON）在 Allegro 里没有内建图形，必须先落地 `.ssm`，
+   * 主 build 脚本才能用 `?figure "<名字>"` 引用它。
+   */
+  readonly shapeScript: string | null;
+  /** shape 脚本应该产出的 `.ssm`（相对作业目录），空数组表示不需要 shape 步骤 */
+  readonly shapeOutputs: readonly string[];
 };
 
 const number = (value: number): string => {
@@ -27,8 +42,32 @@ const number = (value: number): string => {
   return value.toFixed(5).replace(/\.?0+$/, "");
 };
 
+/**
+ * 把坐标压到 SKILL 里实际写出来的精度（`number()` 是 toFixed(5)）。
+ * shape symbol 的 `?figureSize` 必须 ≥ 符号自身 extents —— 如果按未取整的值算包围盒，
+ * 格式化时可能被截小，Allegro 就会判定尺寸不足。先取整再算，两边数字完全一致。
+ */
+const roundToSkillPrecision = (value: number): number => Number(value.toFixed(5));
+
+/**
+ * 把 JS 字符串写成 SKILL 的 `"..."` 字面量。
+ *
+ * 顺序很重要：**先**把反斜杠折成 `/`（Windows 路径），**再**补转义 ——
+ * 否则后面补出来的 `\"`、`\n` 里的反斜杠会被前一步换成 `/`。
+ *
+ * 换行必须转义：2026-10-28 实测，字符串里放真实换行会让 SKILL reader 认为
+ * 字符串没结束，把后面整段代码吞进字符串里 —— 表现为文件末尾「'(' 未闭合」，
+ * 所有焊盘/引脚/refdes 都没创建，`create symbol` 报 `Symbol is missing a refdes`。
+ * 这个坑不会报语法错，只在 Allegro 日志里留一行 warning，所以必须在源头堵死。
+ */
 const skillString = (value: string): string =>
-  `"${value.replaceAll("\\", "/").replaceAll("\"", "\\\"")}"`;
+  `"${value
+    .replaceAll("\\", "/")
+    .replaceAll("\"", "\\\"")
+    .replaceAll("\r\n", "\\n")
+    .replaceAll("\n", "\\n")
+    .replaceAll("\r", "\\n")
+    .replaceAll("\t", "\\t")}"`;
 
 const point = (value: Point): string => `${number(value.x)}:${number(value.y)}`;
 
@@ -50,12 +89,93 @@ const padFigure = (pad: NormalizedPad, width: number, height: number): string =>
   return number(width) === number(height) ? "'SQUARE" : "'RECTANGLE";
 };
 
+/**
+ * 异形焊盘（`PAD~POLYGON`）的形状符号。
+ *
+ * 2026-10-27 真机实验结论（Allegro 17.4S032）：
+ *  - `axlPadFigureTypes()` 里没有任何能表达任意多边形的内建图形；此前 `padFigure()`
+ *    把 polygon 落到默认分支，用包围盒画成 `'RECTANGLE`，HT7533-1 的 2 脚
+ *    （本体 + 细长引脚）被静默画成 1.9×5.38 的矩形 —— 铜皮是错的，还不报错。
+ *  - 正解是 shape symbol：`?figure "<ssm 名>"`（字符串），Allegro 通过 PADPATH 找
+ *    `<名字>.ssm`，`?figureSize` 必须 ≥ 符号 extents。Cadence 自带库里的
+ *    `smd162by68.pad` + `sha_sot89.ssm` 就是这个结构。
+ *  - `.ssm` 的图形必须建在 **ETCH/TOP** 类上：同一套流程里
+ *    `PACKAGE GEOMETRY/SILKSCREEN_TOP`、`BOARD GEOMETRY/OUTLINE` 都建不出 shape
+ *    （axlDBCreateShape 返回 nil，编译出的 .ssm 是空壳，引用时报
+ *    "Illegal figure type or shape name"）。
+ */
+type ShapeSymbol = {
+  /** .ssm 文件名（不含扩展名，小写 —— 与 axlPadstackToDisk 的小写惯例一致） */
+  readonly name: string;
+  /** 焊盘局部坐标的闭合多边形（首点不重复，写 SKILL 时再补） */
+  readonly points: readonly Point[];
+  readonly box: ReturnType<typeof polygonBounds>;
+};
+
+const shapeSymbol = (name: string, points: readonly Point[]): ShapeSymbol | null => {
+  const ring = normalizePolygon(
+    points.map((value) => ({
+      x: roundToSkillPrecision(value.x),
+      y: roundToSkillPrecision(value.y),
+    })),
+  );
+  if (ring.length < 3) {
+    return null;
+  }
+  return { name, points: ring, box: polygonBounds(ring) };
+};
+
+type PolygonSymbols = {
+  readonly copper: ShapeSymbol;
+  readonly mask: ShapeSymbol;
+  readonly paste: ShapeSymbol;
+};
+
+/**
+ * 一个异形焊盘需要的形状符号。铜箔/阻焊/钢网三者尺寸不同，而 `.ssm` 没法在引用时
+ * 缩放，所以按需各建一个（尺寸相同时复用同一个，避免库里堆重复文件）：
+ *  - 阻焊 = 铜箔外扩 solderMaskExpansionMm（offsetPolygon）；
+ *  - 钢网 = 面积比 < 1 时按包围盒中心缩放（scalePolygon），否则同铜箔。
+ */
+const polygonSymbols = (
+  pad: NormalizedPad,
+  solderMaskExpansionMm: number,
+  pasteAreaRatio: number,
+): PolygonSymbols | null => {
+  if (pad.shape !== "polygon" || pad.polygon.length < 3) {
+    return null;
+  }
+  const local = localPadPolygon(pad);
+  const base = derivePadstackName(pad).toLowerCase();
+  const copper = shapeSymbol(base, local);
+  if (copper === null) {
+    return null;
+  }
+  const mask =
+    solderMaskExpansionMm > 0
+      ? (shapeSymbol(`${base}m`, offsetPolygon(local, solderMaskExpansionMm)) ?? copper)
+      : copper;
+  const pasteScale = pad.width * pad.height > 16 ? Math.sqrt(pasteAreaRatio) : 1;
+  const paste =
+    pasteScale === 1 ? copper : (shapeSymbol(`${base}s`, scalePolygon(local, pasteScale)) ?? copper);
+  return { copper, mask, paste };
+};
+
 const padLayerPad = (
   pad: NormalizedPad,
   layer: string,
   scale: number,
   expansion: number,
+  symbols: PolygonSymbols | null,
 ): string => {
+  if (symbols !== null) {
+    const symbol = layer.startsWith("SOLDERMASK")
+      ? symbols.mask
+      : layer.startsWith("PASTEMASK")
+        ? symbols.paste
+        : symbols.copper;
+    return `make_axlPadStackPad(?layer ${skillString(layer)} ?type 'REGULAR ?figure ${skillString(symbol.name)} ?figureSize ${number(symbol.box.width)}:${number(symbol.box.height)})`;
+  }
   const width = pad.width * scale + expansion * 2;
   const height = pad.height * scale + expansion * 2;
   return `make_axlPadStackPad(?layer ${skillString(layer)} ?type 'REGULAR ?figure ${padFigure(pad, width, height)} ?figureSize ${number(width)}:${number(height)}${corners(pad)})`;
@@ -72,6 +192,7 @@ const padDefinition = (
   pasteAreaRatio: number,
 ): string => {
   const name = derivePadstackName(pad);
+  const symbols = polygonSymbols(pad, solderMaskExpansionMm, pasteAreaRatio);
   const throughHole = pad.holeWidth > 0;
   const pasteScale = pad.width * pad.height > 16 ? Math.sqrt(pasteAreaRatio) : 1;
   const drillFigure =
@@ -92,16 +213,16 @@ const padDefinition = (
     : "nil";
   const layerPads = throughHole
     ? `list(
-      ${padLayerPad(pad, "TOP", 1, 0)}
-      ${padLayerPad(pad, "DEFAULT INTERNAL", 1, 0)}
-      ${padLayerPad(pad, "BOTTOM", 1, 0)}
-      ${padLayerPad(pad, "SOLDERMASK_TOP", 1, solderMaskExpansionMm)}
-      ${padLayerPad(pad, "SOLDERMASK_BOTTOM", 1, solderMaskExpansionMm)}
+      ${padLayerPad(pad, "TOP", 1, 0, symbols)}
+      ${padLayerPad(pad, "DEFAULT INTERNAL", 1, 0, symbols)}
+      ${padLayerPad(pad, "BOTTOM", 1, 0, symbols)}
+      ${padLayerPad(pad, "SOLDERMASK_TOP", 1, solderMaskExpansionMm, symbols)}
+      ${padLayerPad(pad, "SOLDERMASK_BOTTOM", 1, solderMaskExpansionMm, symbols)}
     )`
     : `list(
-      ${padLayerPad(pad, "TOP", 1, 0)}
-      ${padLayerPad(pad, "SOLDERMASK_TOP", 1, solderMaskExpansionMm)}
-      ${padLayerPad(pad, "PASTEMASK_TOP", pasteScale, 0)}
+      ${padLayerPad(pad, "TOP", 1, 0, symbols)}
+      ${padLayerPad(pad, "SOLDERMASK_TOP", 1, solderMaskExpansionMm, symbols)}
+      ${padLayerPad(pad, "PASTEMASK_TOP", pasteScale, 0, symbols)}
     )`;
   return `
   padObj = axlDBCreatePadStack(
@@ -111,7 +232,14 @@ const padDefinition = (
     t
   )
   unless(padObj
-    error("Unable to create padstack ${name}\\n")
+    error(${skillString(
+      symbols === null
+        ? `Unable to create padstack ${name}\n`
+        : // 形状符号找不到时 Allegro 只报 "Illegal figure type or shape name"，
+          // 这里补一句怎么修 —— 2026-10-27 实测 .ssm 必须落在 PADPATH 上，
+          // 而批处理下真正生效的是 cwd（Cadence 默认 padpath 含 "."）。
+          `Unable to create padstack ${name} (shape symbol ${symbols.copper.name}.ssm must be in the current directory or on PADPATH)\n`,
+    )})
   )
   ; axlPadstackToDisk 的参数是设计中的 padstack 名（P8 实测），不是文件路径；
   ; .pad 由 Allegro 写入当前作业目录且文件名强制小写，随后由 runner 复制进库目录。
@@ -446,6 +574,86 @@ skill e2a_verify()
 exit
 `;
 
+/**
+ * 生成 shape symbol 用的 SKILL。两个过程都刻意写得极简 —— 真机上任何一步
+ * 返回 nil 都直接 error() 中断，避免出现"编译出的 .ssm 是空壳"这种静默失败
+ * （2026-10-27 实测：图形类选错时 axlDBCreateShape 返回 nil，.ssm 照样生成，
+ * 直到引用它时才报 Illegal figure type or shape name）。
+ */
+const shapeSkillSource = (): string => `; Generated by Easy2ALG. Do not edit manually.
+; 异形焊盘（POLYGON）→ shape symbol（.ssm）。图形必须建在 ETCH/TOP 上。
+procedure(e2a_shape(l_points lo hi)
+  let((path shape)
+    axlDBChangeDesignUnits("millimeters" 4)
+    axlDBChangeDesignExtents(list(lo hi))
+    path = axlPathStart(l_points)
+    unless(path
+      error("Unable to create shape symbol path\\n")
+    )
+    shape = axlDBCreateShape(path t "ETCH/TOP")
+    unless(shape
+      error("Unable to create shape symbol geometry on ETCH/TOP\\n")
+    )
+    shape
+  )
+)
+
+procedure(e2a_compile_shape(symbolPath)
+  axlSetSymbolType("shape")
+  ; axlCompileSymbol 成功时也返回 nil（真机实测），不能拿返回值判成败；
+  ; .ssm 是否真的落地由调用方在进程退出后检查文件。
+  axlCompileSymbol(?symbol symbolPath ?type "shape")
+  t
+)
+`;
+
+/**
+ * 形状符号脚本：每个符号一张"Shape Symbol"图纸，画完存 .dra 再编译成 .ssm。
+ * 全部写完才退出，由 runner 逐个核对 .ssm 是否生成。
+ */
+const shapeScriptSource = (
+  jobDirectory: string,
+  symbols: readonly ShapeSymbol[],
+): string => {
+  const lines = [
+    "setwindow pcb",
+    `skill load(${skillString(join(jobDirectory, "shape.il"))})`,
+  ];
+  for (const symbol of symbols) {
+    const { box } = symbol;
+    const margin = Math.max(1, box.width * 0.1, box.height * 0.1);
+    const lo = `${number(box.minX - margin)}:${number(box.minY - margin)}`;
+    const hi = `${number(box.maxX + margin)}:${number(box.maxY + margin)}`;
+    // axlPathStart 需要显式闭合：末尾补回首点，否则最后一条边缺失。
+    const ring = [...symbol.points, symbol.points[0]].map(point).join(" ");
+    const draPath = join(jobDirectory, `${symbol.name}.dra`);
+    lines.push(
+      "new",
+      `newdrawfillin ${skillString(draPath)} "Shape Symbol" YES`,
+      `skill e2a_shape(list(${ring}) ${lo} ${hi})`,
+      `save_as ${skillString(draPath)}`,
+      `skill e2a_compile_shape(${skillString(join(jobDirectory, symbol.name))})`,
+    );
+  }
+  lines.push("exit", "fillin no");
+  return `${lines.join("\n")}\n`;
+};
+
+/** 一个封装需要的全部形状符号（按名字去重，铜箔/阻焊/钢网可能共用）。 */
+const collectShapeSymbols = (plan: ConversionPlan): readonly ShapeSymbol[] => {
+  const byName = new Map<string, ShapeSymbol>();
+  for (const pad of uniquePadstacks(plan.footprint.pads)) {
+    const symbols = polygonSymbols(pad, plan.solderMaskExpansionMm, plan.pasteAreaRatio);
+    if (symbols === null) {
+      continue;
+    }
+    for (const symbol of [symbols.copper, symbols.mask, symbols.paste]) {
+      byName.set(symbol.name, symbol);
+    }
+  }
+  return [...byName.values()];
+};
+
 export const createAllegroSourceBundle = (
   plan: ConversionPlan,
   jobDirectory: string,
@@ -471,6 +679,11 @@ export const createAllegroSourceBundle = (
       sourceLayerId: 11,
     })),
   ]).map((pad) => `${derivePadstackName(pad).toLowerCase()}.pad`);
+  // 异形焊盘：先落地 shape symbol（.ssm），build 里再按名字引用。
+  // .ssm 必须和 .pad 放在同一个库目录 —— Allegro 通过 PADPATH 找它，
+  // Cadence 自带库（smd162by68.pad + sha_sot89.ssm）也是这么放的。
+  const shapeSymbols = collectShapeSymbols(plan);
+  const shapeFiles = shapeSymbols.map((symbol) => `${symbol.name}.ssm`);
   return {
     symbolName,
     sources: [
@@ -490,11 +703,27 @@ export const createAllegroSourceBundle = (
         relativePath: "verify.scr",
         content: verifyScriptSource(skillPath),
       },
+      ...(shapeSymbols.length === 0
+        ? []
+        : [
+            { relativePath: "shape.il", content: shapeSkillSource() },
+            {
+              relativePath: "shape.scr",
+              content: shapeScriptSource(jobDirectory, shapeSymbols),
+            },
+          ]),
       {
         relativePath: "conversion-plan.json",
         content: `${JSON.stringify(plan, null, 2)}\n`,
       },
     ],
-    expectedOutputs: [`${symbolName}.dra`, `${symbolName}.psm`, ...padstackFiles],
+    expectedOutputs: [
+      `${symbolName}.dra`,
+      `${symbolName}.psm`,
+      ...padstackFiles,
+      ...shapeFiles,
+    ],
+    shapeScript: shapeSymbols.length === 0 ? null : "shape.scr",
+    shapeOutputs: shapeFiles,
   };
 };

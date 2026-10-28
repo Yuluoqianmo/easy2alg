@@ -4,6 +4,12 @@ export type ExternalServiceErrorDetails = {
   statusCode: number | null;
   responseBody: string;
   parameters: Readonly<Record<string, string>>;
+  /**
+   * 是否值得重试。默认 true（网络抖动、5xx 都可能自愈）。
+   * 「元件不存在」这类业务性失败必须显式写 false —— 否则会白白重试三轮，
+   * 用户要多等 1.7 秒才看到结果，日志里还会多两条误导性的 retry 记录。
+   */
+  retryable?: boolean;
 };
 
 export class ExternalServiceError extends Error {

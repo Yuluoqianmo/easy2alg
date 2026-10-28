@@ -101,13 +101,48 @@ export const boxesOverlap = (a: SymbolBox, b: SymbolBox, slack = 0): boolean =>
   a.minY < b.maxY - slack &&
   b.minY < a.maxY - slack;
 
-/** 本体矩形（取 RECT 图元；没有 RECT 时退化为整段包围盒）。 */
+/**
+ * 图形包围盒：只算 RECT / 折线，**不含引脚桩**，也不算文字标注。
+ *
+ * 三极管、MOSFET、二极管、连接器这类符号没有矩形本体，本体就是这堆折线。
+ * 若拿整段 bounds（含 10 单位引脚桩）当本体，引脚名会被摆到引脚末端、脚号跑到框外
+ * —— 用户 2026-10-23 截图里的 C18221391 就是这样（预览和导出的 OLB 同时错）。
+ */
+const drawingBoxOf = (section: NormalizedSymbolSection): SymbolBox | null => {
+  const xs: number[] = [];
+  const ys: number[] = [];
+  for (const shape of section.shapes) {
+    if (shape.kind === "rect") {
+      xs.push(shape.min.x, shape.max.x);
+      ys.push(shape.min.y, shape.max.y);
+    } else if (shape.kind === "polyline") {
+      for (const point of shape.points) {
+        xs.push(point.x);
+        ys.push(point.y);
+      }
+    }
+  }
+  if (xs.length === 0) {
+    return null;
+  }
+  return {
+    minX: Math.min(...xs),
+    minY: Math.min(...ys),
+    maxX: Math.max(...xs),
+    maxY: Math.max(...ys),
+  };
+};
+
+/**
+ * 本体包围盒：优先 RECT；没有 RECT 时用**图元包围盒**（不是整段 bounds）；
+ * 连图元都没有才退到整段 bounds。
+ */
 export const bodyBoxOf = (section: NormalizedSymbolSection): SymbolBox => {
   const rect = section.shapes.find((shape) => shape.kind === "rect");
-  if (rect === undefined || rect.kind !== "rect") {
-    return normalize(section.bounds);
+  if (rect !== undefined && rect.kind === "rect") {
+    return normalize({ minX: rect.min.x, minY: rect.min.y, maxX: rect.max.x, maxY: rect.max.y });
   }
-  return normalize({ minX: rect.min.x, minY: rect.min.y, maxX: rect.max.x, maxY: rect.max.y });
+  return normalize(drawingBoxOf(section) ?? section.bounds);
 };
 
 export type PinSide = "left" | "right" | "top" | "bottom";
@@ -202,6 +237,26 @@ export const pinNumberBox = (pin: NormalizedSymbolPin, body: SymbolBox): SymbolB
 
 /** 预览里引脚名/脚号用的字号（世界单位）。Capture 两侧同为 height≈9。 */
 export const SYMBOL_PIN_FONT = 9;
+
+/**
+ * 段内引脚标签（名字 / 脚号）是否互相压住。
+ *
+ * 用途：Capture 的引脚字号固定 9 单位、不随符号大小变；本体只有 20 单位高的
+ * 三极管/MOSFET，名字从上下两边往中间长，必然撞在一起。解析阶段据此决定
+ * 要不要把整段放大（见 easyeda-symbol.ts 的 buildSection）。
+ */
+export const sectionLabelsCollide = (section: NormalizedSymbolSection): boolean => {
+  const body = bodyBoxOf(section);
+  const boxes = section.pins.flatMap((pin) => [pinNameBox(pin, body), pinNumberBox(pin, body)]);
+  for (let i = 0; i < boxes.length; i += 1) {
+    for (let j = i + 1; j < boxes.length; j += 1) {
+      if (boxesOverlap(boxes[i], boxes[j])) {
+        return true;
+      }
+    }
+  }
+  return false;
+};
 
 /** 引脚文字锚点：名字/编号各一个定位点（预览的 `placeLabel` 用）。 */
 export type PinLabelAnchor = {

@@ -1,7 +1,9 @@
 import { z } from "zod";
+import { AllegroVersionSchema, type AllegroVersion } from "./allegro-version";
 
-export const AllegroVersionSchema = z.enum(["23.1", "22.1", "17.4", "17.2", "16.6"]);
-export type AllegroVersion = z.infer<typeof AllegroVersionSchema>;
+// 版本号不再是固定枚举（见 shared/allegro-version.ts）：Cadence 每年发新版，
+// 写死列表会让 24.1 / 25.1 既选不到、又让手动选的 allegro.exe 被判"版本未知"。
+export { AllegroVersionSchema, type AllegroVersion };
 
 /**
  * 界面偏好 —— 与转换逻辑无关，改了只重写 settings.json、不重跑 Allegro 探测。
@@ -321,6 +323,15 @@ export const NormalizedSymbolSchema = z.object({
 });
 export type NormalizedSymbol = z.infer<typeof NormalizedSymbolSchema>;
 
+/** 库里某个器件的概览（写入前探测同名器件用）。 */
+export const OlbPartSummarySchema = z.object({
+  sectionCount: z.number().int().positive(),
+  pinCount: z.number().int().nonnegative(),
+  /** 本体包围盒横向范围，用来区分"内容真的换了"和"只是名字相同" */
+  bodyWidth: z.number().finite().nullable(),
+});
+export type OlbPartSummary = z.infer<typeof OlbPartSummarySchema>;
+
 export const OlbWriteResultSchema = z.object({
   libraryPath: z.string().min(1),
   /** true = 本次新建了库文件（此前不存在） */
@@ -330,18 +341,28 @@ export const OlbWriteResultSchema = z.object({
   pinCount: z.number().int().nonnegative(),
   backupPath: z.string().min(1).nullable(),
   bytes: z.number().int().nonnegative(),
+  /**
+   * 写入时目标库被 OrCAD Capture 打开着的锁文件路径（null = 没被占用）。
+   *
+   * 这个锁**不阻止写入**（它只是 Capture 的标记文件，.olb 本身没有被独占），
+   * 但 Capture 用的是内存里的旧副本：用户在 Capture 里保存该库时会把我们刚写的
+   * 内容覆盖掉。因此写完后会登记一次"补写"，等锁消失再重放（见 olb-pending.ts）。
+   */
+  captureLockPath: z.string().min(1).nullable().optional(),
+  /** true = 已登记自动补写（Capture 关掉该库后重放一次） */
+  pendingWrite: z.boolean().optional(),
+  /**
+   * true = 库里同名器件的内容与本次**完全一致**（只是重写了一遍）。
+   *
+   * 用户 2026-10-23 的实际场景：器件早写进去了，只是 Capture 缓存着看不到，他以为失败又点
+   * 一次，于是弹"已有同名器件 1段9脚 → 1段9脚"，反而更像工具没写。内容一样就不该再问。
+   */
+  identical: z.boolean().optional(),
+  /** 写入前库里同名器件的概览（补写时用来判断"被 Capture 覆盖"还是"被用户手改"） */
+  previous: OlbPartSummarySchema.nullable().optional(),
   message: z.string().min(1),
 });
 export type OlbWriteResult = z.infer<typeof OlbWriteResultSchema>;
-
-/** 库里某个器件的概览（写入前探测同名器件用）。 */
-export const OlbPartSummarySchema = z.object({
-  sectionCount: z.number().int().positive(),
-  pinCount: z.number().int().nonnegative(),
-  /** 本体包围盒横向范围，用来区分"内容真的换了"和"只是名字相同" */
-  bodyWidth: z.number().finite().nullable(),
-});
-export type OlbPartSummary = z.infer<typeof OlbPartSummarySchema>;
 
 /**
  * 写入 .olb 的结果。目标库里**已有同名器件**时先返回 needsConfirm，
@@ -458,6 +479,12 @@ export const QueueItemSchema = z.object({  id: z.string().regex(/^C\d+$/),
   ]),
   footprint: NormalizedFootprintSchema.nullable(),
   message: z.string(),
+  /**
+   * 行内提示（显示在封装名那一行的位置）。目前只有一种来源：原理图元件已写入，
+   * 但 Capture 正打开着 .olb，需要关掉该库再打开才能看到（用户 2026-10-23）。
+   * 有值时列表里显示它，替代封装名 —— 否则"生成了却看不到"会被误判成失败。
+   */
+  notice: z.string().optional(),
   selected: z.boolean(),
   /**
    * 本地库器件的溯源信息。符号条目（symbols 表）丢了之后要靠它补拉 ——

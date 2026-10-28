@@ -190,6 +190,50 @@ export const sanitizeSymbolName = (raw: string, fallback: string): string => {
   return cleaned.length > 0 ? cleaned : fallback;
 };
 
+/**
+ * 剥掉立创官方库给符号名加的立创编号后缀。
+ *
+ * EasyEDA 官方库把符号命名成 `<型号>_<立创编号>`（`HT7533-1_C3011202`），这个后缀
+ * 进 OrCAD 后既没用又占位号宽度，用户 2026-10-27 要求原理图元件名只留型号本身。
+ * 只在后缀与本器件编号**完全一致**时才剥离 —— 真实型号里出现 `_C1234` 的概率极低，
+ * 但仍然不猜：拿不到编号就不动。
+ */
+export const stripLcscSuffix = (name: string, lcscId: string | undefined): string => {
+  if (lcscId === undefined || lcscId.length === 0) {
+    return name;
+  }
+  const suffix = `_${lcscId}`;
+  return name.length > suffix.length && name.toUpperCase().endsWith(suffix.toUpperCase())
+    ? name.slice(0, name.length - suffix.length)
+    : name;
+};
+
+/**
+ * 原理图元件名的清洗：立创的符号名后面常挂着供应商元数据，进 OrCAD 之前要剥掉。
+ *
+ *  - 末尾括号说明：`HT7533-1-TD(24V)` → `HT7533-1-TD`。
+ *    括号在 OrCAD/Allegro 名字里本来就不合法，以前会被 sanitize 成 `_24V`，
+ *    用户 2026-10-28 明确说"不需要 24V，仅需要 HT7533-1-TD"。
+ *    规格/封装这类尾巴（`(24V)`、`(SOT23-5)`）属于"同一型号的不同写法"，
+ *    不是型号本身；万一剥完撞名，写库前有同名覆盖二次确认兜着。
+ *  - 末尾立创编号：`HT7533-1_C3011202` → `HT7533-1`（用户 2026-10-27）。
+ *
+ * 括号可能不止一层、也可能和立创编号交替出现（`HT7533-1(SOT23-5)_C3011202`），
+ * 所以两种剥离交替做到稳定为止；整名都是括号（如 `(24V)`）时保留原名，免得剥成空串。
+ */
+export const cleanSymbolName = (raw: string, lcscId?: string): string => {
+  let name = raw.trim();
+  for (;;) {
+    const withoutParens = name.replace(/\s*[(（][^()（）]*[)）]\s*$/, "").trim();
+    const next = stripLcscSuffix(withoutParens, lcscId);
+    if (next === name || next.length === 0) {
+      break;
+    }
+    name = next;
+  }
+  return name;
+};
+
 /** 位号前缀：`U?` → `U`；源里没给就用 `U`。 */
 export const refdesPrefixFrom = (raw: unknown): string => {
   const letters = String(raw ?? "")

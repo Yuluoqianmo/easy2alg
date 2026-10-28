@@ -1,8 +1,13 @@
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { allegroVersionFromText } from "../src/main/connectors/allegro-detector";
+import {
+  AllegroDetector,
+  allegroVersionFromText,
+} from "../src/main/connectors/allegro-detector";
+import { resolveAllegroInstall } from "../src/main/connectors/allegro-selection";
+import { resolveCaptureToolchain } from "../src/main/connectors/capture-writer";
 import {
   AllegroRunner,
   verifyPinReport,
@@ -19,6 +24,7 @@ import { normalizePackageName } from "../src/shared/naming";
 import {
   AppSettingsSchema,
   defaultUiSettings,
+  type AllegroInstall,
   type GenerationProgress,
 } from "../src/shared/schemas";
 import { lastWindowCloseAction } from "../src/main/lifecycle";
@@ -221,9 +227,58 @@ describe("Allegro installation detection", () => {
     expect(
       allegroVersionFromText("C:\\Cadence\\SPB_17.2\\tools\\bin\\allegro.exe"),
     ).toBe("17.2");
-    expect(allegroVersionFromText("17.20.060")).toBe("17.2");
-    expect(allegroVersionFromText("16.60.069")).toBe("16.6");
+    // 程序文件报什么就是什么：不把 17.20 换算成 17.2（用户 2026-10-27）
+    expect(allegroVersionFromText("17.20.060")).toBe("17.20.060");
+    expect(allegroVersionFromText("16.60.069")).toBe("16.60.069");
     expect(allegroVersionFromText("15.7")).toBeNull();
+  });
+
+  /**
+   * 用户 2026-10-27：装的是 Allegro 25.1，界面里只有 23.1 可选；手动选中
+   * `C:\Cadence\SPB_25.1\tools\bin\allegro.exe` 还报"无法确定版本"。
+   * 版本号不能写死在代码里，必须从路径 / 文件版本号里读。
+   */
+  it("recognizes 24.1 / 25.1 and versions newer than the built-in list", () => {
+    expect(allegroVersionFromText("C:\\Cadence\\SPB_25.1\\tools\\bin\\allegro.exe")).toBe("25.1");
+    expect(allegroVersionFromText("C:\\Cadence\\SPB_24.1\\tools\\bin\\allegro.exe")).toBe("24.1");
+    expect(
+      allegroVersionFromText("D:/Cadence/Cadence_SPB_26.1/tools/pcb/bin/allegro.exe"),
+    ).toBe("26.1");
+  });
+
+  it("keeps the version string exactly as the program reports it", () => {
+    // 25.10.000 不换算成 25.1，24.10.005 也不换算成 24.1（用户 2026-10-27）
+    expect(allegroVersionFromText("25.10.000")).toBe("25.10.000");
+    expect(allegroVersionFromText("24.10.005")).toBe("24.10.005");
+    expect(allegroVersionFromText("25.1.0.0")).toBe("25.1.0.0");
+  });
+
+  it("does not invent a version out of unrelated text", () => {
+    expect(allegroVersionFromText("C:\\Tools\\2026.10\\allegro.exe")).toBeNull();
+    expect(allegroVersionFromText("C:\\Cadence\\allegro.exe")).toBeNull();
+  });
+
+  it("accepts a manually selected newer executable", async () => {
+    const root = await mkdtemp(join(tmpdir(), "e2a-allegro-"));
+    const binDirectory = join(root, "SPB_25.1", "tools", "bin");
+    await mkdir(binDirectory, { recursive: true });
+    const executablePath = join(
+      binDirectory,
+      process.platform === "win32" ? "allegro.exe" : "allegro",
+    );
+    await writeFile(executablePath, "", "utf8");
+    await expect(
+      new AllegroDetector().inspectExecutable(executablePath, null),
+    ).resolves.toEqual({ version: "25.1", executablePath, detected: true });
+  });
+
+  it("refuses a file that is not the Allegro executable", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "e2a-allegro-"));
+    const executablePath = join(directory, "not-allegro.exe");
+    await writeFile(executablePath, "", "utf8");
+    await expect(
+      new AllegroDetector().inspectExecutable(executablePath, null),
+    ).rejects.toThrow();
   });
 
   it("loads existing settings that predate executable-path detection", () => {
@@ -239,6 +294,101 @@ describe("Allegro installation detection", () => {
         allegroExecutablePath: null,
       }),
     );
+  });
+});
+
+describe("Allegro install selection", () => {
+  const install = (version: string, executablePath: string): AllegroInstall => ({
+    version,
+    executablePath,
+    detected: true,
+  });
+
+  /**
+   * 用户 2026-10-27 的现场：设置里还留着 23.1，手动选的是 25.1 的 exe。
+   * 旧逻辑要求"手动程序的版本 === 设置里的版本"，于是两边对不上 → 直接判"找不到"。
+   */
+  it("prefers the manually selected executable even when the saved version is stale", async () => {
+    const manual = install("25.1", "C:\\Cadence\\SPB_25.1\\tools\\bin\\allegro.exe");
+    await expect(
+      resolveAllegroInstall(
+        { allegroVersion: "23.1", allegroExecutablePath: manual.executablePath },
+        [install("23.1", "C:\\Cadence\\SPB_23.1\\tools\\bin\\allegro.exe")],
+        async () => manual,
+      ),
+    ).resolves.toEqual(manual);
+  });
+
+  it("falls back to the detected install of the configured version", async () => {
+    const detected = install("23.1", "C:\\Cadence\\SPB_23.1\\tools\\bin\\allegro.exe");
+    await expect(
+      resolveAllegroInstall(
+        { allegroVersion: "23.1", allegroExecutablePath: null },
+        [detected],
+        async () => null,
+      ),
+    ).resolves.toEqual(detected);
+  });
+
+  it("falls back to a detected install when the saved manual path is broken", async () => {
+    const detected = install("25.1", "C:\\Cadence\\SPB_25.1\\tools\\bin\\allegro.exe");
+    await expect(
+      resolveAllegroInstall(
+        { allegroVersion: "25.1", allegroExecutablePath: "D:\\gone\\allegro.exe" },
+        [detected],
+        async () => {
+          throw new TypeError("无法判断版本");
+        },
+      ),
+    ).resolves.toEqual(detected);
+  });
+
+  it("never substitutes another installed version for a missing one", async () => {
+    await expect(
+      resolveAllegroInstall(
+        {
+          allegroVersion: "23.1",
+          allegroExecutablePath: "C:\\Cadence\\SPB_25.1\\tools\\bin\\allegro.exe",
+        },
+        [install("25.1", "C:\\Cadence\\SPB_25.1\\tools\\bin\\allegro.exe")],
+        async () => null,
+      ),
+    ).resolves.toBeNull();
+  });
+});
+
+describe("Capture toolchain for newer Allegro releases", () => {
+  /**
+   * 写 .olb 依赖 tools/bin 下的 tclsh.exe + orDb Tcl 桥接 DLL。
+   * 老代码写死 `orDb_Dll_Tcl64.dll`，Cadence 换 Tcl 版本号后新版本会直接报"找不到"。
+   */
+  it("finds tclsh plus a renamed orDb Tcl bridge dll", async () => {
+    const root = await mkdtemp(join(tmpdir(), "e2a-capture-"));
+    const binDirectory = join(root, "SPB_25.1", "tools", "bin");
+    await mkdir(binDirectory, { recursive: true });
+    await writeFile(join(binDirectory, "allegro.exe"), "", "utf8");
+    await writeFile(join(binDirectory, "tclsh.exe"), "", "utf8");
+    await writeFile(join(binDirectory, "orDb_Dll_Tcl86.dll"), "", "utf8");
+    await expect(resolveCaptureToolchain(join(binDirectory, "allegro.exe"))).resolves.toEqual({
+      binDirectory,
+      tclshPath: join(binDirectory, "tclsh.exe"),
+      dllPath: join(binDirectory, "orDb_Dll_Tcl86.dll"),
+    });
+  });
+
+  it("keeps using the classic orDb_Dll_Tcl64.dll when it exists", async () => {
+    const root = await mkdtemp(join(tmpdir(), "e2a-capture-"));
+    const binDirectory = join(root, "SPB_23.1", "tools", "bin");
+    await mkdir(binDirectory, { recursive: true });
+    await writeFile(join(binDirectory, "allegro.exe"), "", "utf8");
+    await writeFile(join(binDirectory, "tclsh.exe"), "", "utf8");
+    await writeFile(join(binDirectory, "orDb_Dll_Tcl64.dll"), "", "utf8");
+    await writeFile(join(binDirectory, "orDb_Dll_Tcl86.dll"), "", "utf8");
+    await expect(resolveCaptureToolchain(join(binDirectory, "allegro.exe"))).resolves.toEqual({
+      binDirectory,
+      tclshPath: join(binDirectory, "tclsh.exe"),
+      dllPath: join(binDirectory, "orDb_Dll_Tcl64.dll"),
+    });
   });
 });
 

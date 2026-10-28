@@ -9,10 +9,15 @@ import type {
 } from "../../shared/schemas";
 import { NormalizedSymbolSchema } from "../../shared/schemas";
 import { avoidLabelOverlapInSection } from "../../shared/symbol-layout";
-import { attachPinLabelAnchors, DEFAULT_SYMBOL_TEXT_HEIGHT } from "../../shared/symbol-labels";
+import {
+  attachPinLabelAnchors,
+  bodyBoxOf,
+  DEFAULT_SYMBOL_TEXT_HEIGHT,
+  sectionLabelsCollide,
+} from "../../shared/symbol-labels";
 import { alignPinsToGrid } from "../../shared/symbol-layout";
 import { dedupePinNames } from "../../shared/symbol-normalize";
-import { refdesPrefixFrom, sanitizeSymbolName } from "./naming";
+import { cleanSymbolName, refdesPrefixFrom, sanitizeSymbolName } from "./naming";
 
 /**
  * 立创编号（在线 EasyEDA **标准版**）链路里的原理图符号解析。
@@ -271,17 +276,35 @@ const RawSymbolSchema = z.object({
 });
 
 /**
- * 把一次器件响应的 `dataStr`（原理图符号）解析成 NormalizedSymbol。
- * 没有符号数据（老器件 / 只有封装）时返回 null，调用方跳过 .olb 写入。
+ * 多子部件器件（双运放 / 双 MOSFET / 四门逻辑 …）的一段符号。
+ *
+ * 实测（C18221391 = AGM609MNA 双 MOSFET、C55807314 = LM358）：
+ * 这类器件 `result.dataStr.shape` 是**空数组**，真实图形逐段放在
+ * `result.subparts[]` 里，每段自带 head.c_para（`pre` 形如 `U?.1`）与 BBox。
+ * 只读 dataStr 的旧逻辑会把它们当成"没有原理图符号"。
  */
-export const parseEasyEdaSymbol = (
+export type EasyEdaSubpart = {
+  readonly title?: string;
+  readonly dataStr?: unknown;
+};
+
+type ParsedPart = {
+  readonly name: string;
+  readonly refdesPrefix: string;
+  readonly pins: readonly NormalizedSymbolPin[];
+  readonly shapes: readonly NormalizedSymbolShape[];
+  readonly bounds: { minX: number; minY: number; maxX: number; maxY: number };
+};
+
+/** 解析一段符号（单段器件的 dataStr，或多子部件器件的一段 subpart）。 */
+const parsePart = (
   rawDataStr: unknown,
   options: {
-    readonly lcscId: string;
     readonly fallbackName: string;
-    readonly pcbFootprint: string;
+    readonly fallbackSymbol: string;
+    readonly lcscId: string;
   },
-): NormalizedSymbol | null => {
+): ParsedPart | null => {
   const parsed = RawSymbolSchema.safeParse(rawDataStr);
   if (!parsed.success) {
     return null;
@@ -295,10 +318,29 @@ export const parseEasyEdaSymbol = (
   if (pins.length === 0 && shapes.length === 0) {
     return null;
   }
-
   const cPara = data.head?.c_para ?? {};
-  const fallback = `SYM_${options.lcscId}`;
-  const bounds = boundsOf(pins, shapes, data.BBox);
+  return {
+    // 官方库的 c_para.name 形如 `HT7533-1-TD(24V)` / `HT7533-1_C3011202`，
+    // 括号说明和立创编号都是供应商元数据，原理图元件名只留型号（见 cleanSymbolName）。
+    name: sanitizeSymbolName(
+      cleanSymbolName(cPara.name ?? options.fallbackName, options.lcscId),
+      options.fallbackSymbol,
+    ),
+    refdesPrefix: refdesPrefixFrom(cPara.pre),
+    pins,
+    shapes,
+    bounds: boundsOf(pins, shapes, data.BBox),
+  };
+};
+
+/** 引脚标签塞不进本体时，整段最多放大到几倍（1 = 不放大）。 */
+const MAX_LABEL_FIT_SCALE = 4;
+/** 只有小于这个尺寸（单位 = 10 mil）的本体才考虑放大：9 单位字高塞不下 40 单位见方的本体。 */
+const LABEL_FIT_MIN_BODY = 40;
+
+/** 单段几何 → NormalizedSymbolSection（锚点归零 + 去重 + 吸附 + 标签避让）。 */
+const buildSection = (part: ParsedPart, name: string): NormalizedSymbolSection => {
+  const { pins, shapes, bounds } = part;
   // 本体锚点归零：取本体 RECT 的 min 角（不是整体 bounds —— 左右引脚伸到 x<0 是正常的）。
   const bodyRect = shapes.find((shape) => shape.kind === "rect");
   const anchorX = bodyRect === undefined ? bounds.minX : Math.min(bodyRect.min.x, bodyRect.max.x);
@@ -306,51 +348,136 @@ export const parseEasyEdaSymbol = (
   const dx = -anchorX;
   const dy = -anchorY;
 
-  const movePoint = (point: Point): Point => ({ x: point.x + dx, y: point.y + dy });
-  const moveShape = (shape: NormalizedSymbolShape): NormalizedSymbolShape => {
-    if (shape.kind === "rect") {
-      return { ...shape, min: movePoint(shape.min), max: movePoint(shape.max) };
-    }
-    if (shape.kind === "polyline") {
-      return { ...shape, points: shape.points.map(movePoint) };
-    }
-    return { ...shape, at: movePoint(shape.at) };
+  const assemble = (scale: number): NormalizedSymbolSection => {
+    const movePoint = (point: Point): Point => ({
+      x: (point.x + dx) * scale,
+      y: (point.y + dy) * scale,
+    });
+    const moveShape = (shape: NormalizedSymbolShape): NormalizedSymbolShape => {
+      if (shape.kind === "rect") {
+        return { ...shape, min: movePoint(shape.min), max: movePoint(shape.max) };
+      }
+      if (shape.kind === "polyline") {
+        return { ...shape, points: shape.points.map(movePoint) };
+      }
+      return { ...shape, at: movePoint(shape.at) };
+    };
+
+    // ① 引脚名去重（Cadence 不接受重复引脚文本）→ ② 引脚标签避让。
+    // 顺序不能反：避让按引脚名的字宽算竖带深度，必须用**最终名字**（GND_18 比 GND 宽）。
+    // 都在解析阶段做，预览与写库看到的是同一份结果。
+    return attachPinLabelAnchors(
+      avoidLabelOverlapInSection(
+        alignPinsToGrid(
+          dedupePinNames({
+            name,
+            bounds: {
+              minX: (bounds.minX + dx) * scale,
+              minY: (bounds.minY + dy) * scale,
+              maxX: (bounds.maxX + dx) * scale,
+              maxY: (bounds.maxY + dy) * scale,
+            },
+            pins: pins.map((pin) => ({
+              ...pin,
+              connection: movePoint(pin.connection),
+              body: movePoint(pin.body),
+            })),
+            shapes: shapes.map(moveShape),
+          }),
+        ),
+      ),
+    );
   };
 
-  // ① 引脚名去重（Cadence 不接受重复引脚文本）→ ② 引脚标签避让。
-  // 顺序不能反：避让按引脚名的字宽算竖带深度，必须用**最终名字**（GND_18 比 GND 宽）。
-  // 都在解析阶段做，预览与写库看到的是同一份结果。
-  const section: NormalizedSymbolSection = attachPinLabelAnchors(
-    avoidLabelOverlapInSection(
-      alignPinsToGrid(
-      dedupePinNames({
-        name: sanitizeSymbolName(cPara.name ?? options.fallbackName, fallback),
-        bounds: {
-          minX: bounds.minX + dx,
-          minY: bounds.minY + dy,
-          maxX: bounds.maxX + dx,
-          maxY: bounds.maxY + dy,
-        },
-        pins: pins.map((pin) => ({
-          ...pin,
-          connection: movePoint(pin.connection),
-          body: movePoint(pin.body),
-        })),
-        shapes: shapes.map(moveShape),
-      }),
+  /**
+   * Capture 的引脚字号固定 9 单位，不随符号大小变。MOSFET / 三极管这类本体只有
+   * 20 单位高的符号，名字从上下两边往中间长必然压在一起 —— 这时把**整段按整数倍
+   * 放大**（引脚与图元一起放大、字号不变），直到标签互不重叠。
+   *
+   * 只对**小本体**放大：大符号（RP2048 这类几百单位的）标签本来就排得开，
+   * 万一避让没解干净也不能把整个符号放大 4 倍。
+   */
+  const natural = assemble(1);
+  const naturalBody = bodyBoxOf(natural);
+  const tooSmall =
+    Math.min(naturalBody.maxX - naturalBody.minX, naturalBody.maxY - naturalBody.minY) <
+    LABEL_FIT_MIN_BODY;
+  if (!tooSmall || !sectionLabelsCollide(natural)) {
+    return natural;
+  }
+  for (let scale = 2; scale <= MAX_LABEL_FIT_SCALE; scale += 1) {
+    const section = assemble(scale);
+    if (!sectionLabelsCollide(section)) {
+      return section;
+    }
+  }
+  return assemble(MAX_LABEL_FIT_SCALE);
+};
+
+/**
+ * 把一次器件响应的符号数据解析成 NormalizedSymbol。
+ *
+ * - 单段器件：图形在 `dataStr` 里（RP2040 / LM393 等绝大多数器件）。
+ * - 多子部件器件：`dataStr.shape` 为空，图形逐段在 `subparts[].dataStr` 里，
+ *   每段对应 OLB 里的一个 LibPart（A/B/C…），用户 2026-10-23 报的 C18221391 就是这种。
+ *
+ * 没有符号数据（老器件 / 只有封装）时返回 null，调用方跳过 .olb 写入。
+ */
+export const parseEasyEdaSymbol = (
+  rawDataStr: unknown,
+  options: {
+    readonly lcscId: string;
+    readonly fallbackName: string;
+    readonly pcbFootprint: string;
+    /** 多子部件器件的各段（`result.subparts`），dataStr 为空时才会用到 */
+    readonly subparts?: readonly EasyEdaSubpart[];
+  },
+): NormalizedSymbol | null => {
+  const fallbackSymbol = `SYM_${options.lcscId}`;
+  const partOptions = {
+    fallbackName: options.fallbackName,
+    fallbackSymbol,
+    lcscId: options.lcscId,
+  };
+
+  const candidates: { readonly part: ParsedPart; readonly title: string | undefined }[] = [];
+  const primary = parsePart(rawDataStr, partOptions);
+  if (primary !== null) {
+    candidates.push({ part: primary, title: undefined });
+  } else {
+    // 多子部件：dataStr 只是空壳，逐段取 subparts。空段（只有电源脚/无图形）直接跳过。
+    for (const subpart of options.subparts ?? []) {
+      const part = parsePart(subpart.dataStr, partOptions);
+      if (part !== null) {
+        candidates.push({ part, title: subpart.title });
+      }
+    }
+  }
+  if (candidates.length === 0) {
+    return null;
+  }
+
+  const symbolName = candidates[0].part.name;
+  const multiSection = candidates.length > 1;
+  const sections = candidates.map(({ part, title }, index) =>
+    buildSection(
+      part,
+      // 段名只用于界面标签 / React key，必须唯一：优先用源 subpart 标题（AGM609MNA.1）。
+      multiSection ? title?.trim() || `${symbolName}.${index + 1}` : symbolName,
     ),
-  ),
   );
+
   const symbol: NormalizedSymbol = {
-    name: sanitizeSymbolName(cPara.name ?? options.fallbackName, fallback),
-    refdesPrefix: refdesPrefixFrom(cPara.pre),
+    name: symbolName,
+    refdesPrefix: candidates[0].part.refdesPrefix,
     pcbFootprint: options.pcbFootprint,
-    sections: [section],
+    sections,
     sourceJson: JSON.stringify({
       source: "easyeda-standard-symbol",
       lcscId: options.lcscId,
-      pinCount: pins.length,
-      shapeCount: shapes.length,
+      pinCount: sections.reduce((total, section) => total + section.pins.length, 0),
+      shapeCount: sections.reduce((total, section) => total + section.shapes.length, 0),
+      sectionNames: sections.map((section) => section.name),
     }),
   };
   return NormalizedSymbolSchema.parse(symbol);

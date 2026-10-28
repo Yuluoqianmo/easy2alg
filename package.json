@@ -1,6 +1,6 @@
 {
   "name": "easy2alg",
-  "version": "0.1.54",
+  "version": "0.2.3",
   "description": "Convert EasyEDA/LCSC footprints into Cadence Allegro libraries",
   "main": "out/main/index.js",
   "type": "module",
@@ -16,12 +16,17 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "dist": "npm run build && electron-builder --publish never",
-    "dist:win": "npm run build && electron-builder --win nsis portable --x64 --publish never",
-    "dist:mac": "npm run build && electron-builder --mac dmg zip --publish never"
+    "dist:win": "node scripts/publish-github.mjs --build-first",
+    "dist:win:local": "node scripts/publish-github.mjs --build-only",
+    "dist:mac": "npm run build && electron-builder --mac dmg zip --publish never",
+    "publish:github": "node scripts/publish-github.mjs",
+    "publish:github:dry": "node scripts/publish-github.mjs --dry-run",
+    "publish:github:only": "node scripts/publish-github.mjs --skip-build"
   },
   "dependencies": {
     "@jlcpcb/core": "0.4.0",
     "adm-zip": "0.5.16",
+    "electron-updater": "6.8.11",
     "lucide-react": "1.26.0",
     "react": "19.2.8",
     "react-dom": "19.2.8",
@@ -51,6 +56,13 @@
     "directories": {
       "output": "release"
     },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "15artis",
+        "repo": "easy2alg"
+      }
+    ],
     "files": [
       "out/**/*",
       "package.json",

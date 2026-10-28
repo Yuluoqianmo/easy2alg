@@ -7,9 +7,17 @@ import {
   type GenerationProgress,
   type HistoryEntry,
 } from "../../shared/schemas";
+import { RELEASE_PAGE_URL, initialUpdateState, type UpdateState } from "../../shared/update";
 
 const SettingsKey = "easy2alg.settings";
 const HistoryKey = "easy2alg.history";
+
+const mockUpdateState: UpdateState = {
+  ...initialUpdateState("0.1.0"),
+  status: "unsupported",
+  supported: false,
+  message: "网页预览不支持自动更新，请到发布页下载安装版。",
+};
 
 const readSettings = (): AppSettings => {
   const saved = window.localStorage.getItem(SettingsKey);
@@ -60,19 +68,19 @@ export const createMockApi = (): Easy2AlgApi => {
     },
     chooseLibraryDirectory: async () => "D:\\AllegroLibrary",
     chooseAllegroExecutable: async () => ({
-      version: "16.6",
-      executablePath: "C:\\Cadence\\SPB_16.6\\tools\\pcb\\bin\\allegro.exe",
+      version: "25.1",
+      executablePath: "C:\\Cadence\\SPB_25.1\\tools\\bin\\allegro.exe",
       detected: true,
     }),
     detectAllegro: async () => [
       {
-        version: "17.2",
-        executablePath: "C:\\Cadence\\SPB_17.2\\tools\\bin\\allegro.exe",
+        version: "25.1",
+        executablePath: "C:\\Cadence\\SPB_25.1\\tools\\bin\\allegro.exe",
         detected: true,
       },
       {
-        version: "16.6",
-        executablePath: "C:\\Cadence\\SPB_16.6\\tools\\pcb\\bin\\allegro.exe",
+        version: "17.2",
+        executablePath: "C:\\Cadence\\SPB_17.2\\tools\\bin\\allegro.exe",
         detected: true,
       },
     ],
@@ -123,6 +131,7 @@ export const createMockApi = (): Easy2AlgApi => {
     writeOlb: async () => {
       throw new Error("浏览器预览不支持写入 OLB，请使用桌面版。");
     },
+    getOlbLock: async () => ({ libraryPath: null, lockPath: null, blocked: false }),
     createPlan: async (footprint) => {
       const largePad = footprint.pads.some((pad) => pad.width * pad.height > 16);
       return {
@@ -253,5 +262,14 @@ export const createMockApi = (): Easy2AlgApi => {
     },
     getHistory: async () => readHistory(),
     openPath: async () => undefined,
+    // 网页预览没有 electron-updater，固定报"不支持"，界面显示"打开发布页"那条分支
+    getUpdateState: async () => mockUpdateState,
+    checkForUpdates: async () => mockUpdateState,
+    downloadUpdate: async () => mockUpdateState,
+    installUpdate: async () => undefined,
+    openReleasePage: async () => {
+      window.open(RELEASE_PAGE_URL, "_blank", "noopener");
+    },
+    onUpdateState: () => () => undefined,
   };
 };

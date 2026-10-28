@@ -2,6 +2,46 @@ import { contextBridge, ipcRenderer } from "electron";
 import type { Easy2AlgApi } from "../shared/ipc";
 import { IpcChannels } from "../shared/ipc";
 import type { GenerationProgress, GenerationStage } from "../shared/schemas";
+import type { UpdateState, UpdateStatus } from "../shared/update";
+
+const UpdateStatuses = new Set<UpdateStatus>([
+  "idle",
+  "checking",
+  "up-to-date",
+  "available",
+  "downloading",
+  "downloaded",
+  "error",
+  "unsupported",
+]);
+
+const parseUpdateState = (rawState: unknown): UpdateState => {
+  if (typeof rawState !== "object" || rawState === null) {
+    throw new TypeError("Update state must be an object");
+  }
+  const value = rawState as Readonly<Record<string, unknown>>;
+  if (
+    typeof value.status !== "string" ||
+    !UpdateStatuses.has(value.status as UpdateStatus) ||
+    typeof value.currentVersion !== "string" ||
+    !(value.latestVersion === null || typeof value.latestVersion === "string") ||
+    typeof value.percent !== "number" ||
+    !(value.message === null || typeof value.message === "string") ||
+    typeof value.releaseUrl !== "string" ||
+    typeof value.supported !== "boolean"
+  ) {
+    throw new TypeError("Update state contains invalid fields");
+  }
+  return {
+    status: value.status as UpdateStatus,
+    currentVersion: value.currentVersion,
+    latestVersion: value.latestVersion as string | null,
+    percent: value.percent,
+    message: value.message as string | null,
+    releaseUrl: value.releaseUrl,
+    supported: value.supported,
+  };
+};
 
 const GenerationStages = new Set<GenerationStage>([
   "preparing",
@@ -70,6 +110,7 @@ const api: Easy2AlgApi = {
   createOlbLibrary: (suggestedName) =>
     ipcRenderer.invoke(IpcChannels.createOlbLibrary, suggestedName),
   writeOlb: (request) => ipcRenderer.invoke(IpcChannels.writeOlb, request),
+  getOlbLock: () => ipcRenderer.invoke(IpcChannels.getOlbLock),
   createPlan: (footprint) => ipcRenderer.invoke(IpcChannels.createPlan, footprint),
   generate: (plan) => ipcRenderer.invoke(IpcChannels.generate, plan),
   onGenerationProgress: (listener) => {
@@ -81,6 +122,21 @@ const api: Easy2AlgApi = {
   },
   getHistory: () => ipcRenderer.invoke(IpcChannels.getHistory),
   openPath: (absolutePath) => ipcRenderer.invoke(IpcChannels.openPath, absolutePath),
+  getUpdateState: async () =>
+    parseUpdateState(await ipcRenderer.invoke(IpcChannels.getUpdateState)),
+  checkForUpdates: async () =>
+    parseUpdateState(await ipcRenderer.invoke(IpcChannels.checkForUpdates)),
+  downloadUpdate: async () =>
+    parseUpdateState(await ipcRenderer.invoke(IpcChannels.downloadUpdate)),
+  installUpdate: () => ipcRenderer.invoke(IpcChannels.installUpdate),
+  openReleasePage: () => ipcRenderer.invoke(IpcChannels.openReleasePage),
+  onUpdateState: (listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, rawState: unknown): void => {
+      listener(parseUpdateState(rawState));
+    };
+    ipcRenderer.on(IpcChannels.updateState, handler);
+    return () => ipcRenderer.removeListener(IpcChannels.updateState, handler);
+  },
 };
 
 contextBridge.exposeInMainWorld("easy2alg", api);

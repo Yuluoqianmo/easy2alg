@@ -66,6 +66,20 @@ const executeAllegro = async (
     join(installationRoot, "tools", "bin"),
     join(installationRoot, "tools", "pcb", "bin"),
   ];
+  // 异形焊盘的 shape symbol（.ssm）由作业目录里的 shape.scr 现场生成，
+  // 主 build 用 ?figure "<名字>" 引用它。**Allegro 17.4 不读系统环境变量里的
+  // padpath**（2026-10-27 实测：设了 OS env 后 axlGetVariableList("padpath") 仍是
+  // env 文件的默认值，运行时 axlSetVariable 也不影响符号查找），真正生效的是
+  // 「cwd 在 padpath 里」—— Cadence 默认 padpath 首项就是 "."，而我们的 cwd
+  // 正是作业目录，所以 .ssm 放作业目录就能被找到。这里仍然把作业目录塞进 OS env
+  // padpath，是给可能读它的其它版本留的兜底，不影响 17.4。
+  const padPath = [
+    workingDirectory,
+    ".",
+    process.env.padpath ?? process.env.PADPATH ?? "",
+  ]
+    .filter((entry) => entry.length > 0)
+    .join(";");
   try {
     const result = await executeFile(executablePath, [...argumentsList], {
       cwd: workingDirectory,
@@ -74,6 +88,8 @@ const executeAllegro = async (
         ...process.env,
         CDSROOT: installationRoot,
         PATH: [...cadencePaths, process.env.PATH ?? ""].join(";"),
+        padpath: padPath,
+        psmpath: padPath,
         // 2026-10-15 实测（S2-S14 实验链）：用户 pcbenv/allegro.ilinit 会按
         // $EDA365_SKILL 拼接加载 EDA365_Skill_Load.il，该 SKILL 包使 Allegro 17.4
         // 在 -nograph 批处理回放 newdrawfillin 时直接段错误（交互模式不受影响）。
@@ -252,9 +268,10 @@ const copyVerifiedOutputs = async (
         null,
       );
     }
-    const outputDirectory = relativeOutput.endsWith(".pad")
-      ? padstackDirectoryFor(unifiedLibraryFolder, libraryDirectory)
-      : symbolDirectoryFor(unifiedLibraryFolder, libraryDirectory);
+    const outputDirectory =
+      relativeOutput.endsWith(".pad") || relativeOutput.endsWith(".ssm")
+        ? padstackDirectoryFor(unifiedLibraryFolder, libraryDirectory)
+        : symbolDirectoryFor(unifiedLibraryFolder, libraryDirectory);
     const destinationPath = join(outputDirectory, basename(relativeOutput));
     await mkdir(outputDirectory, { recursive: true });
     await copyFile(sourcePath, destinationPath);
@@ -362,6 +379,37 @@ export class AllegroRunner {
       }),
     ]);
     progress("launching", 30, `正在启动 Allegro ${settings.allegroVersion}`);
+    // 异形焊盘：先把 shape symbol（.ssm）画出来，主 build 才能引用。
+    // 必须单独跑一趟 —— 同一趟里刚写出的 .ssm 还没进 Allegro 的符号缓存。
+    if (bundle.shapeScript !== null) {
+      progress("generating", 36, "Allegro 正在生成异形焊盘的形状符号");
+      await executeAllegro(
+        install.executablePath,
+        ["-s", bundle.shapeScript, "-nograph"],
+        jobDirectory,
+        "shape-process.log",
+      );
+      await snapshotFile(
+        join(jobDirectory, "allegro.jrl"),
+        join(jobDirectory, "shape.jrl"),
+      );
+      for (const shapeOutput of bundle.shapeOutputs) {
+        const shapePath = join(jobDirectory, shapeOutput);
+        if (!(await fileExists(shapePath)) || (await stat(shapePath)).size === 0) {
+          throw new AllegroExecutionError(
+            `Allegro did not create the shape symbol ${shapeOutput}`,
+            {
+              executablePath: install.executablePath,
+              workingDirectory: jobDirectory,
+              exitCode: 0,
+              stdout: "",
+              stderr: `Missing shape symbol: ${shapePath}（异形焊盘需要 .ssm 才能生成 padstack）`,
+            },
+            null,
+          );
+        }
+      }
+    }
     progress("generating", 42, "Allegro 正在生成焊盘和封装");
     await executeAllegro(
       install.executablePath,

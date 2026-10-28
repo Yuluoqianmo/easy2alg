@@ -1,8 +1,19 @@
 import type { NormalizedCircle, NormalizedPad, Point } from "../../shared/schemas";
+import { normalizePolygon, roundMm } from "../../shared/pad-geometry";
+
+// 多边形几何（normalizePolygon / offsetPolygon / scalePolygon …）住在 shared，
+// 渲染进程画预览也要用同一套算法，避免"预览是矩形、生成是异形"的两套逻辑。
+export {
+  normalizePolygon,
+  offsetPolygon,
+  polygonBounds,
+  polygonSignedArea,
+  scalePolygon,
+} from "../../shared/pad-geometry";
 
 export const EASYEDA_UNIT_MM = 0.254;
 
-export const roundMm = (value: number): number => Math.round(value * 1_000_000) / 1_000_000;
+export { roundMm };
 
 export const toMm = (value: number): number => roundMm(value * EASYEDA_UNIT_MM);
 
@@ -34,7 +45,7 @@ export const parseCoordinatePairs = (value: string): readonly [number, number][]
   return pairs;
 };
 
-const rotatePoint = (point: Point, center: Point, angleDegrees: number): Point => {
+export const rotatePoint = (point: Point, center: Point, angleDegrees: number): Point => {
   const radians = (angleDegrees * Math.PI) / 180;
   const cosine = Math.cos(radians);
   const sine = Math.sin(radians);
@@ -129,6 +140,28 @@ export const enlargePin1Markers = (
     };
   });
 };
+
+/**
+ * 多边形焊盘（异形焊盘）的几何工具在 shared/pad-geometry.ts —— 渲染进程画
+ * PCB 预览也要用同一套算法。这里只保留依赖 rotatePoint 的局部坐标变换。
+ */
+
+/**
+ * 焊盘多边形 → 焊盘局部坐标：先平移到焊盘中心，再反向旋转 pad.rotation。
+ * `padCorners` 对非多边形焊盘做的是「局部包围盒 + 正旋转」，这里必须是它的逆运算，
+ * 否则引脚按 rotation 摆上去之后形状会转两遍。
+ *
+ * 注意 rotatePoint 返回的是**含中心**的绝对坐标（center + R·offset），
+ * 而 padstack 图形必须以焊盘原点为 0，所以这里还要再减掉一次中心。
+ * 少了这一步，形状会整体平移（HT7533-1 实测偏了 1.36mm）。
+ */
+export const localPadPolygon = (pad: NormalizedPad): readonly Point[] =>
+  normalizePolygon(
+    pad.polygon.map((point) => {
+      const rotated = rotatePoint(point, pad.center, -pad.rotation);
+      return { x: rotated.x - pad.center.x, y: rotated.y - pad.center.y };
+    }),
+  );
 
 export const uniquePositiveDeltas = (values: readonly number[]): readonly number[] => {
   const sorted = [...new Set(values.map((value) => roundMm(value)))].sort(
